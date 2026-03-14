@@ -1,7 +1,6 @@
 const express = require("express");
 const { McpServer } = require("@modelcontextprotocol/sdk/server/mcp.js");
 const { StreamableHTTPServerTransport } = require("@modelcontextprotocol/sdk/server/streamableHttp.js");
-const { createMcpExpressApp } = require("@modelcontextprotocol/sdk/server/express.js");
 const z = require("zod");
 
 // --- In-memory user store: phone -> { lastMeal, callCount, preferences[] }
@@ -48,7 +47,7 @@ function suggestMeal(ingredients) {
 }
 
 // --- Express app
-const app = createMcpExpressApp();
+const app = express();
 app.use(express.json());
 
 // GET / health check
