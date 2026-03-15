@@ -55,6 +55,22 @@ app.get("/", (req, res) => {
   res.json({ status: "fridge-to-meal is running" });
 });
 
+app.get("/mcp", async (req, res) => {
+  const server = getMcpServer();
+  const transport = new StreamableHTTPServerTransport({
+    sessionIdGenerator: undefined,
+  });
+  try {
+    await server.connect(transport);
+    await transport.handleRequest(req, res, req.body);
+  } catch (err) {
+    console.error("MCP GET error:", err);
+    if (!res.headersSent) {
+      res.status(500).json({ error: "MCP server error" });
+    }
+  }
+});
+
 // POST /webhook
 app.post("/webhook", (req, res) => {
   const from = req.body && req.body.from;
