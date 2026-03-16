@@ -1,188 +1,158 @@
 const express = require("express");
 const { McpServer } = require("@modelcontextprotocol/sdk/server/mcp.js");
 const { StreamableHTTPServerTransport } = require("@modelcontextprotocol/sdk/server/streamableHttp.js");
-const z = require("zod");
+const { z } = require("zod"); // fix: destructure z from zod
 
-// --- In-memory user store: phone -> { lastMeal, callCount, preferences[] }
-const userStore = Object.create(null);
+// ============================================================
+// IN-MEMORY USER STORE
+// Stores caller history by phone number.
+// In production this would be a database like PostgreSQL.
+// Structure: { "+15551234567": { lastMeal, callCount, preferences[] } }
+// ============================================================
+const userStore = {};
 
-// --- Hardcoded meals with ingredients and instructions
+// ============================================================
+// MEAL DATA + SUGGESTION LOGIC
+// Each meal has a list of key ingredients.
+// suggestMeal() scores every meal by how many of the caller's
+// ingredients match, and returns the best match.
+// ============================================================
 const MEALS = [
   {
     name: "Garlic Chicken Stir Fry",
     ingredients: ["chicken", "garlic", "soy sauce", "vegetables", "oil", "rice"],
-    instructions: "Slice chicken, mince garlic. Heat oil in a wok, stir-fry chicken until cooked. Add garlic and vegetables, stir-fry 2–3 minutes. Add soy sauce, toss and serve over rice.",
+    instructions:
+      "Slice chicken and mince garlic. Heat oil in a pan, cook chicken through. Add garlic and any vegetables, stir-fry 2-3 minutes. Add soy sauce, toss together and serve over rice.",
   },
   {
     name: "Spinach and Egg Scramble",
     ingredients: ["spinach", "eggs", "butter", "salt", "pepper"],
-    instructions: "Wilt spinach in a pan with a little butter. Beat eggs with salt and pepper, pour over spinach. Scramble over medium heat until set. Serve immediately.",
+    instructions:
+      "Melt butter in a pan, add spinach and wilt for one minute. Beat eggs with salt and pepper, pour over spinach and scramble on medium heat until just set.",
   },
   {
     name: "Rice Bowl",
     ingredients: ["rice", "vegetables", "soy sauce", "egg", "oil"],
-    instructions: "Cook rice. Fry an egg and set aside. Sauté vegetables in oil, add cooked rice and soy sauce. Top with the fried egg.",
+    instructions:
+      "Cook rice. Fry an egg and set aside. Saute any vegetables in oil, add cooked rice and a splash of soy sauce. Top with the fried egg.",
   },
   {
-    name: "Pasta",
+    name: "Simple Pasta",
     ingredients: ["pasta", "tomato", "garlic", "olive oil", "basil", "salt"],
-    instructions: "Boil pasta until al dente. Sauté garlic in olive oil, add chopped tomato and basil. Toss with drained pasta and salt.",
+    instructions:
+      "Boil pasta until al dente. Saute garlic in olive oil, add chopped tomato and cook down 5 minutes. Toss with drained pasta, top with fresh basil.",
   },
   {
     name: "Veggie Soup",
     ingredients: ["vegetables", "broth", "onion", "garlic", "salt", "pepper"],
-    instructions: "Sauté chopped onion and garlic. Add broth and chopped vegetables, simmer until tender. Season with salt and pepper.",
+    instructions:
+      "Saute chopped onion and garlic until soft. Add broth and any chopped vegetables. Simmer 20 minutes until tender. Season with salt and pepper.",
   },
 ];
 
 function suggestMeal(ingredients) {
-  const list = Array.isArray(ingredients) ? ingredients.map((i) => String(i).toLowerCase()) : [];
-  let best = { score: -1, meal: MEALS[0] };
+  const callerIngredients = ingredients.map((i) => String(i).toLowerCase());
+
+  let bestMatch = { score: -1, meal: MEALS[0] };
+
   for (const meal of MEALS) {
-    const mealIngreds = meal.ingredients.map((i) => i.toLowerCase());
-    const score = list.filter((i) => mealIngreds.some((m) => m.includes(i) || i.includes(m))).length;
-    if (score > best.score) best = { score, meal };
-  }
-  return { name: best.meal.name, instructions: best.meal.instructions };
-}
+    const score = callerIngredients.filter((callerIng) =>
+      meal.ingredients.some(
+        (mealIng) => mealIng.includes(callerIng) || callerIng.includes(mealIng)
+      )
+    ).length;
 
-// --- Express app
-const app = express();
-app.use(express.json());
-
-// GET / health check
-app.get("/", (req, res) => {
-  res.json({ status: "fridge-to-meal is running" });
-});
-
-app.get("/mcp", async (req, res) => {
-  const server = getMcpServer();
-  const transport = new StreamableHTTPServerTransport({
-    sessionIdGenerator: undefined,
-  });
-  try {
-    await server.connect(transport);
-    await transport.handleRequest(req, res, req.body);
-  } catch (err) {
-    console.error("MCP GET error:", err);
-    if (!res.headersSent) {
-      res.status(500).json({ error: "MCP server error" });
+    if (score > bestMatch.score) {
+      bestMatch = { score, meal };
     }
   }
-});
 
-// POST /webhook
-app.post("/webhook", (req, res) => {
-  const from = req.body && req.body.from;
-  const user = from ? userStore[String(from)] : undefined;
-  const callCount = user ? user.callCount : 0;
-  const lastMeal = user && user.lastMeal ? user.lastMeal : "nothing yet";
-  const favoriteMeal =
-    user && user.preferences && user.preferences.length > 0
-      ? user.preferences[user.preferences.length - 1]
-      : "not set yet";
-  res.json({
-    caller_phone: from || "",
-    has_history: !!user && callCount > 0,
-    last_meal: lastMeal,
-    call_count: callCount,
-    favorite_meal: favoriteMeal,
-    greeting_type: callCount > 0 ? "returning" : "new",
-  });
-});
+  return { name: bestMatch.meal.name, instructions: bestMatch.meal.instructions };
+}
 
-// --- MCP server with 3 tools
-function getMcpServer() {
-  const server = new McpServer({
-    name: "fridge-to-meal",
-    version: "1.0.0",
-  });
+// ============================================================
+// MCP SERVER
+// Exposes 3 tools that the Telnyx AI can call mid-conversation.
+// A new server instance is created per request (stateless).
+// ============================================================
+function buildMcpServer() {
+  const server = new McpServer({ name: "fridge-to-meal", version: "1.0.0" });
 
-  server.registerTool(
+  // Tool 1: Look up a caller's history
+  server.tool(
     "get_user_history",
-    {
-      description: "Get user data from the store by phone number",
-      inputSchema: {
-        phone: z.string().describe("User phone number"),
-      },
-    },
+    "Get the meal history and preferences for a caller by their phone number",
+    { phone: z.string().describe("Caller phone number") },
     async ({ phone }) => {
-      const user = userStore[String(phone)];
-      const data = user
-        ? {
-            lastMeal: user.lastMeal || "nothing yet",
-            callCount: user.callCount || 0,
-            preferences: user.preferences || [],
-          }
-        : { lastMeal: "nothing yet", callCount: 0, preferences: [] };
+      const user = userStore[phone] || {
+        lastMeal: "nothing yet",
+        callCount: 0,
+        preferences: [],
+      };
       return {
-        content: [{ type: "text", text: JSON.stringify(data, null, 2) }],
+        content: [{ type: "text", text: JSON.stringify(user, null, 2) }],
       };
     }
   );
 
-  server.registerTool(
+  // Tool 2: Suggest a meal from a list of ingredients
+  server.tool(
     "suggest_meal",
+    "Suggest the best meal based on available ingredients. Pass phone number to get a personalized tip.",
     {
-      description: "Suggest a meal based on ingredients; optionally include a tip referencing the user's last meal if phone is provided and they have history",
-      inputSchema: {
-        ingredients: z.array(z.string()).describe("List of ingredients"),
-        phone: z.string().optional().describe("Optional user phone for personalized tip"),
-      },
+      ingredients: z.array(z.string()).describe("Ingredients the caller has available"),
+      phone: z.string().optional().describe("Caller phone number for personalization"),
     },
     async ({ ingredients, phone }) => {
-      const result = suggestMeal(ingredients);
+      const meal = suggestMeal(ingredients);
+
+      // Personalized tip if this is a returning caller
       let tip = "";
-      if (phone) {
-        const user = userStore[String(phone)];
-        if (user && user.lastMeal) {
-          tip = ` Since you had ${user.lastMeal} last time, this is a nice change of pace.`;
-        }
+      if (phone && userStore[phone]?.lastMeal) {
+        tip = `Last time you made ${userStore[phone].lastMeal} — this is something different!`;
       }
-      const text = `Meal: ${result.name}\n\nInstructions: ${result.instructions}${tip ? "\n\nTip:" + tip : ""}`;
+
       return {
         content: [
           {
             type: "text",
-            text: JSON.stringify({ meal_name: result.name, instructions: result.instructions, tip: tip || undefined }, null, 2),
+            text: JSON.stringify(
+              { meal_name: meal.name, instructions: meal.instructions, tip: tip || undefined },
+              null,
+              2
+            ),
           },
         ],
       };
     }
   );
 
-  server.registerTool(
+  // Tool 3: Save what the caller made and whether they liked it
+  server.tool(
     "save_preference",
+    "Save the meal a caller made and whether they liked it. Updates their history for future calls.",
     {
-      description: "Update user with last meal, increment call count, and optionally add meal to preferences if liked",
-      inputSchema: {
-        phone: z.string().describe("User phone number"),
-        meal_name: z.string().describe("Name of the meal"),
-        liked: z.boolean().describe("Whether the user liked the meal"),
-      },
+      phone: z.string().describe("Caller phone number"),
+      meal_name: z.string().describe("Name of the meal they made"),
+      liked: z.boolean().describe("Whether the caller liked the meal"),
     },
     async ({ phone, meal_name, liked }) => {
-      const key = String(phone);
-      if (!userStore[key]) {
-        userStore[key] = { lastMeal: "", callCount: 0, preferences: [] };
+      if (!userStore[phone]) {
+        userStore[phone] = { lastMeal: "", callCount: 0, preferences: [] };
       }
-      const user = userStore[key];
-      user.lastMeal = meal_name;
-      user.callCount = (user.callCount || 0) + 1;
+
+      userStore[phone].lastMeal = meal_name;
+      userStore[phone].callCount += 1;
+
       if (liked) {
-        user.preferences = user.preferences || [];
-        user.preferences.push(meal_name);
+        userStore[phone].preferences.push(meal_name);
       }
+
       return {
         content: [
           {
             type: "text",
-            text: JSON.stringify({
-              ok: true,
-              lastMeal: user.lastMeal,
-              callCount: user.callCount,
-              preferences: user.preferences,
-            }),
+            text: JSON.stringify({ saved: true, ...userStore[phone] }),
           },
         ],
       };
@@ -192,17 +162,105 @@ function getMcpServer() {
   return server;
 }
 
-// POST /mcp — handle MCP requests with StreamableHTTPServerTransport
-app.post("/mcp", async (req, res) => {
-  const server = getMcpServer();
-  const transport = new StreamableHTTPServerTransport({
-    sessionIdGenerator: undefined,
+// ============================================================
+// EXPRESS APP
+// ============================================================
+const app = express();
+app.use(express.json());
+
+// Health check — confirms the server is running
+app.get("/", (req, res) => {
+  res.json({ status: "fridge-to-meal is running" });
+});
+
+// ============================================================
+// DYNAMIC WEBHOOK VARIABLES ENDPOINT
+// Telnyx calls this before every conversation starts.
+// We return caller context so the AI can personalize the call
+// using {{last_meal}} and {{greeting_type}} in the system prompt.
+// ============================================================
+app.post("/webhook", (req, res) => {
+  const callerPhone = req.body?.from || req.body?.caller_id || "";
+  const user = userStore[callerPhone];
+
+  console.log(`[webhook] incoming call from ${callerPhone}`);
+
+  res.json({
+    caller_phone: callerPhone,
+    has_history: !!user && user.callCount > 0,
+    last_meal: user?.lastMeal || "nothing yet",
+    call_count: user?.callCount || 0,
+    favorite_meal: user?.preferences?.slice(-1)[0] || "not set yet",
+    greeting_type: user?.callCount > 0 ? "returning" : "new",
   });
+});
+
+// ============================================================
+// MCP TOOL DISCOVERY ENDPOINT (GET)
+// Telnyx checks this to see what tools are available.
+// Returns a static list matching the tools registered above.
+// ============================================================
+app.get("/mcp", (req, res) => {
+  res.json({
+    tools: [
+      {
+        name: "get_user_history",
+        description: "Get the meal history and preferences for a caller by their phone number",
+        inputSchema: {
+          type: "object",
+          properties: {
+            phone: { type: "string", description: "Caller phone number" },
+          },
+          required: ["phone"],
+        },
+      },
+      {
+        name: "suggest_meal",
+        description: "Suggest the best meal based on available ingredients",
+        inputSchema: {
+          type: "object",
+          properties: {
+            ingredients: {
+              type: "array",
+              items: { type: "string" },
+              description: "Ingredients the caller has available",
+            },
+            phone: { type: "string", description: "Caller phone number for personalization" },
+          },
+          required: ["ingredients"],
+        },
+      },
+      {
+        name: "save_preference",
+        description: "Save the meal a caller made and whether they liked it",
+        inputSchema: {
+          type: "object",
+          properties: {
+            phone: { type: "string", description: "Caller phone number" },
+            meal_name: { type: "string", description: "Name of the meal they made" },
+            liked: { type: "boolean", description: "Whether the caller liked the meal" },
+          },
+          required: ["phone", "meal_name", "liked"],
+        },
+      },
+    ],
+  });
+});
+
+// ============================================================
+// MCP TOOL CALL ENDPOINT (POST)
+// Telnyx sends tool calls here during the conversation.
+// Each request gets a fresh server + transport (stateless).
+// ============================================================
+app.post("/mcp", async (req, res) => {
+  const server = buildMcpServer();
+  const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+
   try {
     await server.connect(transport);
     await transport.handleRequest(req, res, req.body);
   } catch (err) {
-    console.error("MCP request error:", err);
+    console.error("[mcp] error:", err.message);
     if (!res.headersSent) {
       res.status(500).json({
         jsonrpc: "2.0",
@@ -218,6 +276,9 @@ app.post("/mcp", async (req, res) => {
   }
 });
 
+// ============================================================
+// START SERVER
+// ============================================================
 const PORT = Number(process.env.PORT) || 3000;
 app.listen(PORT, () => {
   console.log(`fridge-to-meal server listening on port ${PORT}`);
