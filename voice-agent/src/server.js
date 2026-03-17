@@ -326,4 +326,13 @@ app.post("/mcp", async (req, res) => {
 });
 
 const PORT = Number(process.env.PORT) || 3000;
+// Keep-alive ping — prevents Railway free tier from sleeping
+setInterval(async () => {
+  try {
+    await fetch(`http://localhost:${PORT}/`);
+    console.log("[keep-alive] ping");
+  } catch (err) {
+    console.error("[keep-alive] failed:", err.message);
+  }
+}, 5 * 60 * 1000); // every 5 minutes
 app.listen(PORT, () => console.log(`fridge-to-meal server listening on port ${PORT}`));
