@@ -178,7 +178,9 @@ app.post("/tools/get_user_history", async (req, res) => {
 
 app.post("/tools/search_recipes", async (req, res) => {
   try {
-    const result = await handleSearchRecipes(req.body);
+    console.log("[tools/search_recipes] body:", JSON.stringify(req.body));
+    const params = req.body?.parameters || req.body?.input || req.body || {};
+    const result = await handleSearchRecipes(params);
     res.json(result);
   } catch (err) {
     console.error("[tools/search_recipes] error:", err.message);
