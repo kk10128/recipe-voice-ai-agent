@@ -5,6 +5,7 @@ const { z } = require("zod");
 
 // --- In-memory user store
 // phone -> { callCount, lastMeal, preferences: { dietary, wantLowCarb, wantHighProtein }, likedMeals[] }
+// In production this would be a real database like PostgreSQL
 const userStore = {};
 
 // --- Express app
@@ -18,8 +19,9 @@ app.get("/", (req, res) => {
 
 // ============================================================
 // DYNAMIC WEBHOOK VARIABLES
-// Telnyx calls this before every conversation.
-// Injects caller context into the system prompt.
+// Telnyx calls this before every conversation starts.
+// Returns caller context injected into the system prompt as
+// {{greeting_type}}, {{last_meal}}, {{dietary_restrictions}} etc.
 // ============================================================
 app.post("/webhook", (req, res) => {
   const callerPhone = req.body?.from || req.body?.caller_id || "";
@@ -43,6 +45,8 @@ app.post("/webhook", (req, res) => {
 
 // ============================================================
 // MCP SERVER
+// Exposes 5 tools the Telnyx AI calls mid-conversation.
+// New instance per request — fully stateless.
 // ============================================================
 function getMcpServer() {
   const server = new McpServer({ name: "fridge-to-meal", version: "1.0.0" });
@@ -63,10 +67,12 @@ function getMcpServer() {
     }
   );
 
-  // Tool 2: Search recipes by ingredients via Spoonacular API
+  // Tool 2: Search real recipes via Spoonacular API
+  // ranking=2 minimizes missed ingredients
+  // We also filter client-side to only return recipes with 2 or fewer missing ingredients
   server.tool(
     "search_recipes",
-    "Search for real recipes based on ingredients the caller has. Returns 3 options by name.",
+    "Search for real recipes based on ingredients the caller has. Returns up to 3 options.",
     {
       ingredients: z.array(z.string()).describe("Ingredients the caller has"),
       phone: z.string().optional().describe("Caller phone number to apply dietary filters"),
@@ -75,16 +81,14 @@ function getMcpServer() {
       const user = phone ? userStore[phone] : null;
       const dietary = user?.preferences?.dietary || "";
       const lowCarb = user?.preferences?.wantLowCarb || false;
-      const highProtein = user?.preferences?.wantHighProtein || false;
 
-      // Build diet param for Spoonacular
       let dietParam = "";
       if (dietary === "vegetarian") dietParam = "&diet=vegetarian";
       else if (dietary === "vegan") dietParam = "&diet=vegan";
       else if (dietary === "gluten-free") dietParam = "&diet=gluten+free";
       else if (lowCarb) dietParam = "&diet=low-carb";
 
-      const url = `https://api.spoonacular.com/recipes/findByIngredients?ingredients=${ingredients.join(",")}&number=3&ranking=1&ignorePantry=true${dietParam}&apiKey=${process.env.SPOONACULAR_API_KEY}`;
+      const url = `https://api.spoonacular.com/recipes/findByIngredients?ingredients=${ingredients.join(",")}&number=5&ranking=2&ignorePantry=true${dietParam}&apiKey=${process.env.SPOONACULAR_API_KEY}`;
 
       const response = await fetch(url);
       const recipes = await response.json();
@@ -93,15 +97,21 @@ function getMcpServer() {
         return { content: [{ type: "text", text: JSON.stringify({ error: "No recipes found" }) }] };
       }
 
-      const options = recipes.map((r, i) => ({
+      // Filter to recipes with 2 or fewer missing ingredients
+      // Fall back to all results if nothing passes the filter
+      const filtered = recipes.filter((r) => r.missedIngredientCount <= 2);
+      const finalRecipes = (filtered.length > 0 ? filtered : recipes).slice(0, 3);
+
+      const options = finalRecipes.map((r, i) => ({
         number: i + 1,
         id: r.id,
         name: r.title,
         usedIngredients: r.usedIngredients?.map((i) => i.name).join(", "),
-        missedIngredients: r.missedIngredients?.map((i) => i.name).join(", "),
+        missedIngredients: r.missedIngredients?.map((i) => i.name).join(", ") || "none",
+        missedCount: r.missedIngredientCount,
       }));
 
-      console.log(`[search_recipes] found ${options.length} recipes for ${ingredients.join(", ")}`);
+      console.log(`[search_recipes] returning ${options.length} recipes for: ${ingredients.join(", ")}`);
       return { content: [{ type: "text", text: JSON.stringify(options, null, 2) }] };
     }
   );
@@ -109,7 +119,7 @@ function getMcpServer() {
   // Tool 3: Get full recipe details by Spoonacular recipe ID
   server.tool(
     "get_recipe_details",
-    "Get the full recipe instructions and nutrition info for a recipe the caller picked",
+    "Get full recipe instructions and nutrition info for a recipe the caller picked",
     { recipe_id: z.number().describe("Spoonacular recipe ID from search_recipes results") },
     async ({ recipe_id }) => {
       const url = `https://api.spoonacular.com/recipes/${recipe_id}/information?includeNutrition=true&apiKey=${process.env.SPOONACULAR_API_KEY}`;
@@ -117,11 +127,16 @@ function getMcpServer() {
       const response = await fetch(url);
       const recipe = await response.json();
 
-      const steps = recipe.analyzedInstructions?.[0]?.steps?.map((s) => s.step).join(" ") || recipe.instructions || "No instructions available";
+      const steps =
+        recipe.analyzedInstructions?.[0]?.steps?.map((s) => s.step).join(" ") ||
+        recipe.instructions ||
+        "No instructions available";
 
-      const nutrition = recipe.nutrition?.nutrients?.filter((n) =>
-        ["Calories", "Protein", "Carbohydrates", "Fat"].includes(n.name)
-      ).map((n) => `${n.name}: ${Math.round(n.amount)}${n.unit}`).join(", ") || "Nutrition info unavailable";
+      const nutrition =
+        recipe.nutrition?.nutrients
+          ?.filter((n) => ["Calories", "Protein", "Carbohydrates", "Fat"].includes(n.name))
+          .map((n) => `${n.name}: ${Math.round(n.amount)}${n.unit}`)
+          .join(", ") || "Nutrition info unavailable";
 
       const details = {
         name: recipe.title,
@@ -129,10 +144,9 @@ function getMcpServer() {
         cookTime: `${recipe.readyInMinutes} minutes`,
         nutrition,
         instructions: steps,
-        sourceUrl: recipe.sourceUrl || "",
       };
 
-      console.log(`[get_recipe_details] fetched details for recipe ${recipe_id}`);
+      console.log(`[get_recipe_details] fetched recipe ${recipe_id}`);
       return { content: [{ type: "text", text: JSON.stringify(details, null, 2) }] };
     }
   );
@@ -163,9 +177,7 @@ function getMcpServer() {
         }),
       });
 
-      const data = await response.json();
       const success = response.ok;
-
       console.log(`[send_recipe_sms] SMS to ${phone}: ${success ? "sent" : "failed"}`);
       return {
         content: [{ type: "text", text: JSON.stringify({ sent: success, to: phone }) }],
@@ -173,7 +185,7 @@ function getMcpServer() {
     }
   );
 
-  // Tool 5: Save preferences and what the caller made
+  // Tool 5: Save meal choice and dietary preferences
   server.tool(
     "save_preference",
     "Save the caller's meal choice, whether they liked it, and any dietary preferences they mentioned",
@@ -181,7 +193,7 @@ function getMcpServer() {
       phone: z.string().describe("Caller phone number"),
       meal_name: z.string().describe("Name of the meal they chose"),
       liked: z.boolean().describe("Whether the caller liked the meal"),
-      dietary: z.string().optional().describe("Any dietary restriction mentioned: vegetarian, vegan, gluten-free, or none"),
+      dietary: z.string().optional().describe("Dietary restriction: vegetarian, vegan, gluten-free, or none"),
       low_carb: z.boolean().optional().describe("Whether the caller wants low carb meals"),
       high_protein: z.boolean().optional().describe("Whether the caller wants high protein meals"),
     },
@@ -208,7 +220,10 @@ function getMcpServer() {
   return server;
 }
 
-// --- MCP tool discovery (GET)
+// ============================================================
+// MCP TOOL DISCOVERY (GET)
+// Telnyx hits this first to see what tools are available.
+// ============================================================
 app.get("/mcp", (req, res) => {
   res.json({
     tools: [
@@ -217,7 +232,7 @@ app.get("/mcp", (req, res) => {
         description: "Get the full history and dietary preferences for a caller",
         inputSchema: {
           type: "object",
-          properties: { phone: { type: "string" } },
+          properties: { phone: { type: "string", description: "Caller phone number" } },
           required: ["phone"],
         },
       },
@@ -227,8 +242,8 @@ app.get("/mcp", (req, res) => {
         inputSchema: {
           type: "object",
           properties: {
-            ingredients: { type: "array", items: { type: "string" } },
-            phone: { type: "string" },
+            ingredients: { type: "array", items: { type: "string" }, description: "Ingredients the caller has" },
+            phone: { type: "string", description: "Caller phone number for dietary filters" },
           },
           required: ["ingredients"],
         },
@@ -238,7 +253,7 @@ app.get("/mcp", (req, res) => {
         description: "Get full recipe instructions and nutrition for a recipe the caller picked",
         inputSchema: {
           type: "object",
-          properties: { recipe_id: { type: "number" } },
+          properties: { recipe_id: { type: "number", description: "Spoonacular recipe ID" } },
           required: ["recipe_id"],
         },
       },
@@ -248,10 +263,10 @@ app.get("/mcp", (req, res) => {
         inputSchema: {
           type: "object",
           properties: {
-            phone: { type: "string" },
-            recipe_name: { type: "string" },
-            instructions: { type: "string" },
-            cook_time: { type: "string" },
+            phone: { type: "string", description: "Caller phone number" },
+            recipe_name: { type: "string", description: "Name of the recipe" },
+            instructions: { type: "string", description: "Recipe instructions" },
+            cook_time: { type: "string", description: "How long it takes to cook" },
           },
           required: ["phone", "recipe_name", "instructions"],
         },
@@ -262,12 +277,12 @@ app.get("/mcp", (req, res) => {
         inputSchema: {
           type: "object",
           properties: {
-            phone: { type: "string" },
-            meal_name: { type: "string" },
-            liked: { type: "boolean" },
-            dietary: { type: "string" },
-            low_carb: { type: "boolean" },
-            high_protein: { type: "boolean" },
+            phone: { type: "string", description: "Caller phone number" },
+            meal_name: { type: "string", description: "Name of the meal" },
+            liked: { type: "boolean", description: "Whether the caller liked it" },
+            dietary: { type: "string", description: "Dietary restriction if mentioned" },
+            low_carb: { type: "boolean", description: "Wants low carb meals" },
+            high_protein: { type: "boolean", description: "Wants high protein meals" },
           },
           required: ["phone", "meal_name", "liked"],
         },
@@ -276,7 +291,10 @@ app.get("/mcp", (req, res) => {
   });
 });
 
-// --- MCP tool calls (POST)
+// ============================================================
+// MCP TOOL CALLS (POST)
+// Telnyx sends actual tool calls here mid-conversation.
+// ============================================================
 app.post("/mcp", async (req, res) => {
   const server = getMcpServer();
   const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
@@ -286,7 +304,11 @@ app.post("/mcp", async (req, res) => {
   } catch (err) {
     console.error("[mcp] error:", err.message);
     if (!res.headersSent) {
-      res.status(500).json({ jsonrpc: "2.0", error: { code: -32603, message: "Internal server error" }, id: null });
+      res.status(500).json({
+        jsonrpc: "2.0",
+        error: { code: -32603, message: "Internal server error" },
+        id: null,
+      });
     }
   } finally {
     res.on("close", () => {
