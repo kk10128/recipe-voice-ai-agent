@@ -11,6 +11,10 @@ const userStore = {};
 // --- Express app
 const app = express();
 app.use(express.json());
+app.use((req, res, next) => {
+  res.setHeader("Content-Type", "application/json");
+  next();
+});
 
 // Health check
 app.get("/", (req, res) => {
@@ -68,8 +72,7 @@ function getMcpServer() {
   );
 
   // Tool 2: Search real recipes via Spoonacular API
-  // ranking=2 minimizes missed ingredients
-  // We also filter client-side to only return recipes with 2 or fewer missing ingredients
+  // Fetches 5, filters to missedIngredientCount <= 2, returns top 3
   server.tool(
     "search_recipes",
     "Search for real recipes based on ingredients the caller has. Returns up to 3 options.",
@@ -294,10 +297,14 @@ app.get("/mcp", (req, res) => {
 // ============================================================
 // MCP TOOL CALLS (POST)
 // Telnyx sends actual tool calls here mid-conversation.
+// enableJsonResponse ensures correct content type for Telnyx.
 // ============================================================
 app.post("/mcp", async (req, res) => {
   const server = getMcpServer();
-  const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+  const transport = new StreamableHTTPServerTransport({
+    sessionIdGenerator: undefined,
+    enableJsonResponse: true,
+  });
   try {
     await server.connect(transport);
     await transport.handleRequest(req, res, req.body);
