@@ -81,7 +81,7 @@ async function handleSearchRecipes({ ingredients, phone }) {
     return { error: "No recipes found" };
   }
 
-  const filtered = recipes.filter((r) => r.missedIngredientCount <= 2);
+  const filtered = recipes.filter((r) => r.missedIngredientCount === 0);
   const finalRecipes = (filtered.length > 0 ? filtered : recipes).slice(0, 3);
 
   return finalRecipes.map((r, i) => ({
