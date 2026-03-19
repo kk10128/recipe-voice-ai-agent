@@ -56,3 +56,7 @@ This enables personalized greetings and preference-aware conversations.
 2. Assistant offers best-fit options.
 3. Caller picks one meal.
 4. Assistant reads recipe details for caller to create.
+
+## Try It
+Call: +1 (747) 335-6004
+https://recipe-voice-ai-agent-production.up.railway.app/
