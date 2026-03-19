@@ -556,7 +556,7 @@ app.get("/mcp", (req, res) => {
       { name: "get_user_history", description: "Get the full history and dietary preferences for a caller", inputSchema: { type: "object", properties: { phone: { type: "string" }, call_id: { type: "string" }, from: { type: "string" }, caller_id: { type: "string" }, caller_phone: { type: "string" } }, required: [] } },
       { name: "search_recipes", description: "Search for real recipes based on ingredients the caller has", inputSchema: { type: "object", properties: { ingredients: { type: "array", items: { type: "string" } }, phone: { type: "string" } }, required: ["ingredients"] } },
       { name: "get_recipe_details", description: "Get full recipe instructions and nutrition", inputSchema: { type: "object", properties: { recipe_id: { type: "number" } }, required: ["recipe_id"] } },
-      { name: "save_preference", description: "Save the caller's meal choice and dietary preferences", inputSchema: { type: "object", properties: { phone: { type: "string" }, meal_name: { type: "string" }, liked: { type: "boolean" }, dietary: { type: "string" }, low_carb: { type: "boolean" }, high_protein: { type: "boolean" } }, required: ["phone", "meal_name", "liked"] } },
+      { name: "save_preference", description: "Save the caller's meal choice and dietary preferences", inputSchema: { type: "object", properties: { phone: { type: "string" }, call_id: { type: "string" }, from: { type: "string" }, meal_name: { type: "string" }, liked: { type: "boolean" }, dietary: { type: "string" }, low_carb: { type: "boolean" }, high_protein: { type: "boolean" } }, required: ["meal_name", "liked"] } },
     ],
   });
 });
