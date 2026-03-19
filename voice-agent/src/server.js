@@ -415,8 +415,11 @@ async function handleGetRecipeDetails({ recipe_id }) {
 
 async function handleSavePreference({ phone, call_id, meal_name, liked, dietary, low_carb, high_protein }) {
   const target = resolvePhone({ phone, call_id });
-  console.log(`[tool] save_preference for ${target}: ${meal_name}`);
+  console.log(
+    `[tool] save_preference phone=${phone || "(empty)"} call_id=${call_id || "(empty)"} resolved=${target || "(empty)"} meal=${meal_name || "(empty)"}`
+  );
   if (!target) {
+    console.warn("[tool] save_preference FAILED — could not resolve phone");
     return { saved: false, error: "missing_phone" };
   }
   const likedBool = coerceBoolean(liked);
@@ -486,11 +489,15 @@ app.post("/tools/get_recipe_details", async (req, res) => {
 
 app.post("/tools/save_preference", async (req, res) => {
   try {
+    console.log("[tools/save_preference] body:", JSON.stringify(req.body));
     const extracted = extractPhoneFromRequest(req);
     const call_id = req.body?.call_id || req.body?.conversation_id || extractCallIdFromRequest(req);
     const phoneFromBody = normalizePhone(req.body?.phone);
     const phoneFromCallCtx = call_id ? callContextStore[call_id]?.phone : "";
     const phone = phoneFromBody || extracted || phoneFromCallCtx || "";
+    console.log(
+      `[tools/save_preference] extracted=${extracted || "(empty)"} call_id=${call_id || "(empty)"} callCtxPhone=${phoneFromCallCtx || "(empty)"} phoneArg=${req.body?.phone || "(empty)"} phoneUsed=${phone || "(empty)"}`
+    );
     const result = await handleSavePreference({ ...req.body, phone, call_id });
     res.json(result);
   } catch (err) {
