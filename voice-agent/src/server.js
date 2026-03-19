@@ -51,6 +51,8 @@ loadUserStore();
 // Per-call context so tool calls don't rely on global "last caller" state.
 // call_id -> { phone }
 const callContextStore = {};
+const CALL_CONTEXT_TTL_MS = 30 * 60 * 1000;
+const CALL_CONTEXT_SWEEP_MS = 5 * 60 * 1000;
 
 function coerceBoolean(value) {
   if (typeof value === "boolean") return value;
@@ -178,10 +180,28 @@ function resolvePhone({ phone, call_id }) {
   const normalizedCallId = normalizeCallId(call_id);
   if (normalizedCallId) {
     const ctx = callContextStore[normalizedCallId];
-    if (ctx?.phone) return ctx.phone;
+    if (ctx?.phone) {
+      // Touch on read to keep active calls alive.
+      ctx.updatedAtMs = Date.now();
+      return ctx.phone;
+    }
   }
 
   return "";
+}
+
+function pruneCallContextStore() {
+  const now = Date.now();
+  let removed = 0;
+  for (const [callId, ctx] of Object.entries(callContextStore)) {
+    if (!ctx?.updatedAtMs || now - ctx.updatedAtMs > CALL_CONTEXT_TTL_MS) {
+      delete callContextStore[callId];
+      removed += 1;
+    }
+  }
+  if (removed > 0) {
+    console.log(`[call-context] pruned ${removed} stale entr${removed === 1 ? "y" : "ies"}`);
+  }
 }
 
 async function fetchJsonWithTimeout(url, { timeoutMs = 12000, ...options } = {}) {
@@ -407,7 +427,6 @@ async function handleSavePreference({ phone, call_id, meal_name, liked, dietary,
 
   const user = userStore[target];
   user.lastMeal = meal_name;
-  user.callCount += 1;
   if (likedBool && !user.likedMeals.includes(meal_name)) user.likedMeals.push(meal_name);
   if (dietary) user.preferences.dietary = dietary;
   if (low_carb !== undefined) user.preferences.wantLowCarb = low_carb;
@@ -593,6 +612,9 @@ setInterval(async () => {
     console.error("[keep-alive] failed:", err.message);
   }
 }, 5 * 60 * 1000);
+
+// Prevent unbounded growth of per-call context in long-running servers.
+setInterval(pruneCallContextStore, CALL_CONTEXT_SWEEP_MS);
 
 const PORT = Number(process.env.PORT) || 3000;
 app.listen(PORT, () => console.log(`fridge-to-meal server listening on port ${PORT}`));
