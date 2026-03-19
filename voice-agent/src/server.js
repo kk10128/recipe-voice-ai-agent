@@ -51,9 +51,6 @@ loadUserStore();
 // Per-call context so tool calls don't rely on global "last caller" state.
 // call_id -> { phone }
 const callContextStore = {};
-// Dedupe successful SMS sends to avoid re-speaking/sending duplicates.
-// phone -> { key, sentAtMs }
-const smsSuccessByPhone = {};
 
 function coerceBoolean(value) {
   if (typeof value === "boolean") return value;
@@ -64,12 +61,6 @@ function coerceBoolean(value) {
   if (["true", "t", "yes", "y", "1"].includes(s)) return true;
   if (["false", "f", "no", "n", "0"].includes(s)) return false;
   return false;
-}
-
-function buildSmsDedupeKey({ recipe_name, instructions }) {
-  // Keep it stable and short; no need for full content.
-  const instr = (instructions || "").replace(/\s+/g, " ").slice(0, 120);
-  return `${recipe_name || ""}|${instr}`;
 }
 
 // --- Express app
@@ -402,85 +393,6 @@ async function handleGetRecipeDetails({ recipe_id }) {
   };
 }
 
-async function handleSendRecipeSms({ phone, call_id, recipe_name, instructions, cook_time }) {
-  const target = resolvePhone({ phone, call_id });
-  console.log(`[tool] send_recipe_sms to ${target}`);
-  if (!target) {
-    return { sent: false, error: "missing_phone", message: "Could not determine caller phone number. Do not tell the caller the recipe was sent." };
-  }
-  // No emoji — keeps the message ASCII so each SMS part holds 153 chars (vs 67
-  // for Unicode). 10-part limit × 153 = 1530 chars total budget.
-  const MAX_MSG_CHARS = 1530;
-  const header = `${recipe_name}${cook_time ? ` (${cook_time})` : ""}\n\n`;
-  const footer = `\n\n— Fridge Friend`;
-  const instructionBudget = MAX_MSG_CHARS - header.length - footer.length;
-  const trimmedInstructions =
-    instructions.length > instructionBudget
-      ? instructions.slice(0, instructionBudget - 3).trimEnd() + "..."
-      : instructions;
-  const message = `${header}${trimmedInstructions}${footer}`;
-  const rawFrom = process.env.TELNYX_FROM_PHONE_NUMBER || process.env.TELNYX_PHONE_NUMBER || "";
-  const fromNumber = normalizePhone(rawFrom);
-  console.log(`[tools/send_recipe_sms] fromUsed=${fromNumber || rawFrom || "(empty)"}`);
-  if (!fromNumber) {
-    return { sent: false, error: "invalid_sender_number" };
-  }
-
-  const telnyxApiKey = process.env.TELNYX_API_KEY;
-  if (!telnyxApiKey) {
-    return { sent: false, error: "missing_telnyx_api_key" };
-  }
-
-  const dedupeKey = buildSmsDedupeKey({ recipe_name, instructions });
-  const existing = smsSuccessByPhone[target];
-  if (existing && existing.key === dedupeKey && Date.now() - existing.sentAtMs < 10 * 60 * 1000) {
-    return { sent: true, to: target, deduped: true };
-  }
-
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 12000);
-  let response;
-  try {
-    response = await fetch("https://api.telnyx.com/v2/messages", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${telnyxApiKey}`,
-      },
-      body: JSON.stringify({
-        from: fromNumber,
-        to: target,
-        text: message,
-      }),
-      signal: controller.signal,
-    });
-  } finally {
-    clearTimeout(timeout);
-  }
-
-  const success = response.ok;
-  let errorBody = "";
-  if (!success) {
-    try {
-      // Telnyx errors are often JSON; fall back to text if needed.
-      errorBody = await response.text();
-    } catch (e) {
-      errorBody = "";
-    }
-    if (errorBody && errorBody.length > 800) errorBody = errorBody.slice(0, 800) + "...";
-  }
-  console.log(
-    `[tool] SMS to ${target}: ${success ? "sent" : "failed"}${!success ? ` (${response.status}) ${errorBody}` : ""}`
-  );
-  if (!success) {
-    // Force the agent to handle failures instead of confidently claiming success.
-    throw new Error(`telnyx_sms_failed (${response.status}): ${errorBody || "unknown_error"}`);
-  }
-
-  smsSuccessByPhone[target] = { key: dedupeKey, sentAtMs: Date.now() };
-  return { sent: true, to: target, deduped: false };
-}
-
 async function handleSavePreference({ phone, call_id, meal_name, liked, dietary, low_carb, high_protein }) {
   const target = resolvePhone({ phone, call_id });
   console.log(`[tool] save_preference for ${target}: ${meal_name}`);
@@ -553,33 +465,6 @@ app.post("/tools/get_recipe_details", async (req, res) => {
   }
 });
 
-app.post("/tools/send_recipe_sms", async (req, res) => {
-  try {
-    console.log("[tools/send_recipe_sms] body:", JSON.stringify(req.body));
-    const relevantHeaders = Object.fromEntries(
-      Object.entries(req.headers).filter(([k]) =>
-        k !== "authorization" &&
-        (k.startsWith("x-") || ["from", "caller", "phone", "call", "telnyx", "conversation", "session"].some(kw => k.includes(kw)))
-      )
-    );
-    if (Object.keys(relevantHeaders).length) {
-      console.log("[tools/send_recipe_sms] headers:", JSON.stringify(relevantHeaders));
-    }
-    const extracted = extractPhoneFromRequest(req);
-    const call_id = req.body?.call_id || req.body?.conversation_id || extractCallIdFromRequest(req);
-    // Prefer explicit phone from body; fall back to header extraction; then call context store
-    const phoneFromBody = normalizePhone(req.body?.phone);
-    const phoneFromCallCtx = call_id ? callContextStore[call_id]?.phone : "";
-    const phone = phoneFromBody || extracted || phoneFromCallCtx || "";
-    console.log(`[tools/send_recipe_sms] extracted=${extracted} callCtxPhone=${phoneFromCallCtx} phoneArg=${req.body?.phone} phoneUsed=${phone}`);
-    const result = await handleSendRecipeSms({ ...req.body, phone, call_id });
-    res.json(result);
-  } catch (err) {
-    console.error("[tools/send_recipe_sms] error:", err.message);
-    res.status(500).json({ error: err.message });
-  }
-});
-
 app.post("/tools/save_preference", async (req, res) => {
   try {
     const extracted = extractPhoneFromRequest(req);
@@ -642,23 +527,6 @@ function getMcpServer() {
     })
   );
 
-  server.tool("send_recipe_sms", "Text the full recipe instructions to the caller's phone number",
-    {
-      phone: z.string().optional().describe("Caller phone number"),
-      call_id: z.string().optional().describe("Telnyx call/conversation id"),
-      from: z.string().optional().describe("Caller phone number (alt field)"),
-      recipe_name: z.string().describe("Name of the recipe"),
-      instructions: z.string().describe("Recipe instructions"),
-      cook_time: z.string().optional().describe("Cook time"),
-    },
-    async ({ phone, call_id, from, recipe_name, instructions, cook_time }) => {
-      const normalized = normalizePhone(phone) || normalizePhone(from);
-      return {
-        content: [{ type: "text", text: JSON.stringify(await handleSendRecipeSms({ phone: normalized, call_id, recipe_name, instructions, cook_time }), null, 2) }],
-      };
-    }
-  );
-
   server.tool("save_preference", "Save the caller's meal choice and dietary preferences",
     {
       phone: z.string().optional().describe("Caller phone number"),
@@ -688,7 +556,6 @@ app.get("/mcp", (req, res) => {
       { name: "get_user_history", description: "Get the full history and dietary preferences for a caller", inputSchema: { type: "object", properties: { phone: { type: "string" }, call_id: { type: "string" }, from: { type: "string" }, caller_id: { type: "string" }, caller_phone: { type: "string" } }, required: [] } },
       { name: "search_recipes", description: "Search for real recipes based on ingredients the caller has", inputSchema: { type: "object", properties: { ingredients: { type: "array", items: { type: "string" } }, phone: { type: "string" } }, required: ["ingredients"] } },
       { name: "get_recipe_details", description: "Get full recipe instructions and nutrition", inputSchema: { type: "object", properties: { recipe_id: { type: "number" } }, required: ["recipe_id"] } },
-      { name: "send_recipe_sms", description: "Text the recipe to the caller", inputSchema: { type: "object", properties: { phone: { type: "string" }, recipe_name: { type: "string" }, instructions: { type: "string" }, cook_time: { type: "string" } }, required: ["phone", "recipe_name", "instructions"] } },
       { name: "save_preference", description: "Save the caller's meal choice and dietary preferences", inputSchema: { type: "object", properties: { phone: { type: "string" }, meal_name: { type: "string" }, liked: { type: "boolean" }, dietary: { type: "string" }, low_carb: { type: "boolean" }, high_protein: { type: "boolean" } }, required: ["phone", "meal_name", "liked"] } },
     ],
   });
