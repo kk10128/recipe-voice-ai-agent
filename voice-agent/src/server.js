@@ -82,7 +82,19 @@ app.get("/", (req, res) => {
 // ============================================================
 app.post("/webhook", (req, res) => {
   const callerPhone = extractPhoneFromRequest(req);
-  const user = userStore[callerPhone];
+  const existingUser = callerPhone ? userStore[callerPhone] : undefined;
+  const isReturning = !!(existingUser && existingUser.callCount > 0);
+
+  // Increment call count at call start so "returning" greeting works even
+  // if the caller doesn't accept SMS (which is when save_preference runs).
+  if (callerPhone) {
+    if (!userStore[callerPhone]) {
+      userStore[callerPhone] = { callCount: 0, lastMeal: "nothing yet", preferences: {}, likedMeals: [] };
+    }
+    userStore[callerPhone].callCount += 1;
+  }
+
+  const user = callerPhone ? userStore[callerPhone] : undefined;
 
   console.log(`[webhook] call from ${callerPhone}`);
   if (callerPhone) lastWebhookCallerPhone = callerPhone;
@@ -91,7 +103,7 @@ app.post("/webhook", (req, res) => {
 
   res.json({
     caller_phone: callerPhone,
-    greeting_type: user?.callCount > 0 ? "returning" : "new",
+    greeting_type: isReturning ? "returning" : "new",
     last_meal: user?.lastMeal || "nothing yet",
     call_count: user?.callCount || 0,
     dietary_restrictions: preferences.dietary || "none",
