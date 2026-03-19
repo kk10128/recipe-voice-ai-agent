@@ -121,8 +121,9 @@ app.post("/webhook", (req, res) => {
 
 async function handleGetUserHistory({ phone }) {
   const normalized = normalizePhone(phone);
-  console.log(`[tool] get_user_history for ${normalized || phone}`);
-  const user = normalized ? userStore[normalized] : null;
+  const target = normalized || lastWebhookCallerPhone;
+  console.log(`[tool] get_user_history for ${target || normalized || phone}`);
+  const user = target ? userStore[target] : null;
   return (
     user || {
     callCount: 0,
@@ -136,7 +137,8 @@ async function handleGetUserHistory({ phone }) {
 async function handleSearchRecipes({ ingredients, phone }) {
   const normalized = normalizePhone(phone);
   console.log(`[tool] search_recipes for ${ingredients}`);
-  const user = normalized ? userStore[normalized] : null;
+  const target = normalized || lastWebhookCallerPhone;
+  const user = target ? userStore[target] : null;
   const dietary = user?.preferences?.dietary || "";
   const lowCarb = user?.preferences?.wantLowCarb || false;
 
@@ -197,8 +199,8 @@ async function handleGetRecipeDetails({ recipe_id }) {
 
 async function handleSendRecipeSms({ phone, recipe_name, instructions, cook_time }) {
   const normalized = normalizePhone(phone);
-  console.log(`[tool] send_recipe_sms to ${normalized || phone}`);
   const target = normalized || lastWebhookCallerPhone;
+  console.log(`[tool] send_recipe_sms to ${target}`);
   if (!target) {
     return { sent: false, error: "missing_phone" };
   }
@@ -218,14 +220,22 @@ async function handleSendRecipeSms({ phone, recipe_name, instructions, cook_time
   });
 
   const success = response.ok;
-  console.log(`[tool] SMS to ${phone}: ${success ? "sent" : "failed"}`);
-  return { sent: success, to: phone };
+  let errorBody = "";
+  try {
+    errorBody = !success ? await response.text() : "";
+  } catch (e) {
+    errorBody = "";
+  }
+  console.log(
+    `[tool] SMS to ${target}: ${success ? "sent" : "failed"}${!success ? ` (${response.status}) ${errorBody}` : ""}`
+  );
+  return { sent: success, to: target };
 }
 
 async function handleSavePreference({ phone, meal_name, liked, dietary, low_carb, high_protein }) {
   const normalized = normalizePhone(phone);
-  console.log(`[tool] save_preference for ${normalized || phone}: ${meal_name}`);
   const target = normalized || lastWebhookCallerPhone;
+  console.log(`[tool] save_preference for ${target}: ${meal_name}`);
   if (!target) {
     return { saved: false, error: "missing_phone" };
   }
