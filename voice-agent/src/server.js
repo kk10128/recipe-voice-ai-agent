@@ -1,12 +1,39 @@
 const express = require("express");
+const fs = require("fs");
+const path = require("path");
 const { McpServer } = require("@modelcontextprotocol/sdk/server/mcp.js");
 const { StreamableHTTPServerTransport } = require("@modelcontextprotocol/sdk/server/streamableHttp.js");
 const { z } = require("zod");
 
-// --- In-memory user store
+// --- Persistent user store backed by a JSON file.
 // phone -> { callCount, lastMeal, preferences: { dietary, wantLowCarb, wantHighProtein }, likedMeals[] }
-// In production this would be a real database like PostgreSQL
+// Survives server restarts. For true cross-deployment persistence attach a
+// Railway volume at /data and set USER_STORE_PATH=/data/users.json.
+const USER_STORE_PATH = process.env.USER_STORE_PATH || path.join(__dirname, "../../users.json");
 const userStore = {};
+
+function loadUserStore() {
+  try {
+    if (fs.existsSync(USER_STORE_PATH)) {
+      const data = JSON.parse(fs.readFileSync(USER_STORE_PATH, "utf8"));
+      Object.assign(userStore, data);
+      console.log(`[store] loaded ${Object.keys(data).length} user(s) from ${USER_STORE_PATH}`);
+    }
+  } catch (err) {
+    console.error("[store] failed to load user store:", err.message);
+  }
+}
+
+function saveUserStore() {
+  try {
+    fs.mkdirSync(path.dirname(USER_STORE_PATH), { recursive: true });
+    fs.writeFileSync(USER_STORE_PATH, JSON.stringify(userStore, null, 2));
+  } catch (err) {
+    console.error("[store] failed to save user store:", err.message);
+  }
+}
+
+loadUserStore();
 // Per-call context so tool calls don't rely on global "last caller" state.
 // call_id -> { phone }
 const callContextStore = {};
@@ -205,6 +232,7 @@ app.post("/webhook", (req, res) => {
       userStore[callerPhone] = { callCount: 0, lastMeal: "nothing yet", preferences: {}, likedMeals: [] };
     }
     userStore[callerPhone].callCount += 1;
+    saveUserStore();
   }
 
   const user = callerPhone ? userStore[callerPhone] : undefined;
@@ -333,7 +361,7 @@ async function handleSendRecipeSms({ phone, call_id, recipe_name, instructions, 
   const target = resolvePhone({ phone, call_id });
   console.log(`[tool] send_recipe_sms to ${target}`);
   if (!target) {
-    return { sent: false, error: "missing_phone" };
+    return { sent: false, error: "missing_phone", message: "Could not determine caller phone number. Do not tell the caller the recipe was sent." };
   }
   // No emoji — keeps the message ASCII so each SMS part holds 153 chars (vs 67
   // for Unicode). 10-part limit × 153 = 1530 chars total budget.
@@ -428,6 +456,7 @@ async function handleSavePreference({ phone, call_id, meal_name, liked, dietary,
   if (low_carb !== undefined) user.preferences.wantLowCarb = low_carb;
   if (high_protein !== undefined) user.preferences.wantHighProtein = high_protein;
 
+  saveUserStore();
   return { saved: true, ...user };
 }
 
