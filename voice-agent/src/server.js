@@ -9,15 +9,29 @@ const { z } = require("zod");
 // phone -> { callCount, lastMeal, preferences: { dietary, wantLowCarb, wantHighProtein }, likedMeals[] }
 // Survives server restarts. For true cross-deployment persistence attach a
 // Railway volume at /data and set USER_STORE_PATH=/data/users.json.
-const USER_STORE_PATH = process.env.USER_STORE_PATH || path.join(__dirname, "../../users.json");
+const LOCAL_USER_STORE_PATH = path.join(__dirname, "../../users.json");
+// Prefer Railway's persistent volume mount point if present.
+const DEFAULT_USER_STORE_PATH = "/data/users.json";
+const USER_STORE_PATH =
+  process.env.USER_STORE_PATH ||
+  (fs.existsSync("/data") ? DEFAULT_USER_STORE_PATH : LOCAL_USER_STORE_PATH);
 const userStore = {};
 
 function loadUserStore() {
   try {
     if (fs.existsSync(USER_STORE_PATH)) {
       const data = JSON.parse(fs.readFileSync(USER_STORE_PATH, "utf8"));
-      Object.assign(userStore, data);
+      // Re-key phone numbers into a consistent "+E164" format.
+      for (const [rawKey, value] of Object.entries(data)) {
+        const keyStr = String(rawKey);
+        if (keyStr.includes("{{") && keyStr.includes("}}")) continue;
+        const digits = keyStr.replace(/\D/g, "");
+        if (digits.length < 7) continue;
+        userStore[`+${digits}`] = value;
+      }
       console.log(`[store] loaded ${Object.keys(data).length} user(s) from ${USER_STORE_PATH}`);
+    } else {
+      console.log(`[store] no existing user store at ${USER_STORE_PATH} (starting fresh)`);
     }
   } catch (err) {
     console.error("[store] failed to load user store:", err.message);
@@ -72,11 +86,10 @@ function normalizePhone(value) {
   const lower = trimmed.toLowerCase();
   if (lower === "null" || lower === "undefined") return "";
 
-  // Keep a leading "+" if present; strip everything else.
-  const hasPlus = trimmed.startsWith("+");
   const digits = trimmed.replace(/\D/g, "");
   if (digits.length < 7) return "";
-  return hasPlus ? `+${digits}` : digits;
+  // Always key by '+digits' so we don't split users into '147...' vs '+147...'.
+  return `+${digits}`;
 }
 
 function extractPhoneFromRequest(req) {
@@ -243,6 +256,12 @@ app.post("/webhook", (req, res) => {
   }
 
   const preferences = user?.preferences || {};
+
+  console.log(
+    `[webhook] callerPhone=${callerPhone || "(empty)"} callId=${callId || "(empty)"} greeting_type=${
+      isReturning ? "returning" : "new"
+    } previous_callCount=${existingUser?.callCount ?? 0}`
+  );
 
   res.json({
     caller_phone: callerPhone,
@@ -640,7 +659,7 @@ function getMcpServer() {
 app.get("/mcp", (req, res) => {
   res.json({
     tools: [
-      { name: "get_user_history", description: "Get the full history and dietary preferences for a caller", inputSchema: { type: "object", properties: { phone: { type: "string" } }, required: ["phone"] } },
+      { name: "get_user_history", description: "Get the full history and dietary preferences for a caller", inputSchema: { type: "object", properties: { phone: { type: "string" }, call_id: { type: "string" }, from: { type: "string" }, caller_id: { type: "string" }, caller_phone: { type: "string" } }, required: [] } },
       { name: "search_recipes", description: "Search for real recipes based on ingredients the caller has", inputSchema: { type: "object", properties: { ingredients: { type: "array", items: { type: "string" } }, phone: { type: "string" } }, required: ["ingredients"] } },
       { name: "get_recipe_details", description: "Get full recipe instructions and nutrition", inputSchema: { type: "object", properties: { recipe_id: { type: "number" } }, required: ["recipe_id"] } },
       { name: "send_recipe_sms", description: "Text the recipe to the caller", inputSchema: { type: "object", properties: { phone: { type: "string" }, recipe_name: { type: "string" }, instructions: { type: "string" }, cook_time: { type: "string" } }, required: ["phone", "recipe_name", "instructions"] } },
