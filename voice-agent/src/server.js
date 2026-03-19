@@ -284,10 +284,15 @@ app.post("/webhook", (req, res) => {
     } previous_callCount=${existingUser?.callCount ?? 0}`
   );
 
+  const opening_line = isReturning
+    ? `Hey, welcome back! Last time you made ${user?.lastMeal || "something tasty"}. What are you working with tonight?`
+    : "Hey! I'm Fridge Friend. Any dietary restrictions I should know about? Like vegetarian, vegan, gluten free, or low carb?";
+
   res.json({
     caller_phone: callerPhone,
     call_id: callId,
     greeting_type: isReturning ? "returning" : "new",
+    opening_line,
     last_meal: user?.lastMeal || "nothing yet",
     call_count: user?.callCount || 0,
     dietary_restrictions: preferences.dietary || "none",
