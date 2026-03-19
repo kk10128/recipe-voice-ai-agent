@@ -7,9 +7,29 @@ const { z } = require("zod");
 // phone -> { callCount, lastMeal, preferences: { dietary, wantLowCarb, wantHighProtein }, likedMeals[] }
 // In production this would be a real database like PostgreSQL
 const userStore = {};
-// Fallback for tool calls that arrive without a real phone number.
-// This relies on the assumption of one active call flow at a time.
-let lastWebhookCallerPhone = "";
+// Per-call context so tool calls don't rely on global "last caller" state.
+// call_id -> { phone }
+const callContextStore = {};
+// Dedupe successful SMS sends to avoid re-speaking/sending duplicates.
+// phone -> { key, sentAtMs }
+const smsSuccessByPhone = {};
+
+function coerceBoolean(value) {
+  if (typeof value === "boolean") return value;
+  if (value === null || value === undefined) return false;
+  if (typeof value === "number") return value !== 0;
+  if (typeof value !== "string") return false;
+  const s = value.trim().toLowerCase();
+  if (["true", "t", "yes", "y", "1"].includes(s)) return true;
+  if (["false", "f", "no", "n", "0"].includes(s)) return false;
+  return false;
+}
+
+function buildSmsDedupeKey({ recipe_name, instructions }) {
+  // Keep it stable and short; no need for full content.
+  const instr = (instructions || "").replace(/\s+/g, " ").slice(0, 120);
+  return `${recipe_name || ""}|${instr}`;
+}
 
 // --- Express app
 const app = express();
@@ -69,6 +89,91 @@ function extractPhoneFromRequest(req) {
   return "";
 }
 
+function normalizeCallId(value) {
+  if (value === null || value === undefined) return "";
+  if (typeof value !== "string") return "";
+  const trimmed = value.trim();
+  if (!trimmed) return "";
+  // If templating didn't run, we might get literal placeholders.
+  if (trimmed.includes("{{") && trimmed.includes("}}")) return "";
+  return trimmed;
+}
+
+function extractCallIdFromRequest(req) {
+  const body = req?.body || {};
+  const headers = req?.headers || {};
+
+  const candidates = [
+    body.call_control_id,
+    body.callControlId,
+    body.call_id,
+    body.callId,
+    body.conversation_id,
+    body.conversationId,
+    // Common Telnyx-ish nesting shapes
+    body?.data?.call_control_id,
+    body?.data?.callId,
+    body?.data?.payload?.call_control_id,
+    body?.data?.payload?.callId,
+    body?.payload?.call_control_id,
+    body?.payload?.callId,
+    body?.payload?.conversation_id,
+    // Common headers (best-effort)
+    headers["x-call-control-id"],
+    headers["x-call-id"],
+    headers["x-telnyx-call-control-id"],
+    headers["x-telnyx-call-id"],
+    headers["x-conversation-id"],
+  ];
+
+  for (const c of candidates) {
+    const id = normalizeCallId(c);
+    if (id) return id;
+  }
+  return "";
+}
+
+function resolvePhone({ phone, call_id }) {
+  const normalizedPhone = normalizePhone(phone);
+  if (normalizedPhone) return normalizedPhone;
+
+  const normalizedCallId = normalizeCallId(call_id);
+  if (normalizedCallId) {
+    const ctx = callContextStore[normalizedCallId];
+    if (ctx?.phone) return ctx.phone;
+  }
+
+  return "";
+}
+
+async function fetchJsonWithTimeout(url, { timeoutMs = 12000, ...options } = {}) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const response = await fetch(url, { ...options, signal: controller.signal });
+    if (response.ok) {
+      const text = await response.text();
+      try {
+        return JSON.parse(text);
+      } catch {
+        throw new Error(`upstream_non_json_success (${response.status})`);
+      }
+    }
+
+    const text = await response.text();
+    const excerpt = text ? text.slice(0, 700) : "";
+    throw new Error(`upstream_error (${response.status}): ${excerpt || "unknown_error"}`);
+  } catch (err) {
+    if (err?.name === "AbortError") {
+      throw new Error(`fetch_timeout after ${timeoutMs}ms`);
+    }
+    throw err;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 // Health check
 app.get("/", (req, res) => {
   res.json({ status: "fridge-to-meal is running" });
@@ -82,6 +187,7 @@ app.get("/", (req, res) => {
 // ============================================================
 app.post("/webhook", (req, res) => {
   const callerPhone = extractPhoneFromRequest(req);
+  const callId = extractCallIdFromRequest(req);
   const existingUser = callerPhone ? userStore[callerPhone] : undefined;
   const isReturning = !!(existingUser && existingUser.callCount > 0);
 
@@ -97,12 +203,15 @@ app.post("/webhook", (req, res) => {
   const user = callerPhone ? userStore[callerPhone] : undefined;
 
   console.log(`[webhook] call from ${callerPhone}`);
-  if (callerPhone) lastWebhookCallerPhone = callerPhone;
+  if (callerPhone && callId) {
+    callContextStore[callId] = { phone: callerPhone, updatedAtMs: Date.now() };
+  }
 
   const preferences = user?.preferences || {};
 
   res.json({
     caller_phone: callerPhone,
+    call_id: callId,
     greeting_type: isReturning ? "returning" : "new",
     last_meal: user?.lastMeal || "nothing yet",
     call_count: user?.callCount || 0,
@@ -119,10 +228,9 @@ app.post("/webhook", (req, res) => {
 // Shared between the direct /tools/ endpoints and the MCP server.
 // ============================================================
 
-async function handleGetUserHistory({ phone }) {
-  const normalized = normalizePhone(phone);
-  const target = normalized || lastWebhookCallerPhone;
-  console.log(`[tool] get_user_history for ${target || normalized || phone}`);
+async function handleGetUserHistory({ phone, call_id }) {
+  const target = resolvePhone({ phone, call_id });
+  console.log(`[tool] get_user_history for ${target || phone || call_id}`);
   const user = target ? userStore[target] : null;
   return (
     user || {
@@ -134,10 +242,9 @@ async function handleGetUserHistory({ phone }) {
   );
 }
 
-async function handleSearchRecipes({ ingredients, phone }) {
-  const normalized = normalizePhone(phone);
+async function handleSearchRecipes({ ingredients, phone, call_id }) {
   console.log(`[tool] search_recipes for ${ingredients}`);
-  const target = normalized || lastWebhookCallerPhone;
+  const target = resolvePhone({ phone, call_id });
   const user = target ? userStore[target] : null;
   const dietary = user?.preferences?.dietary || "";
   const lowCarb = user?.preferences?.wantLowCarb || false;
@@ -148,10 +255,20 @@ async function handleSearchRecipes({ ingredients, phone }) {
   else if (dietary === "gluten-free") dietParam = "&diet=gluten+free";
   else if (lowCarb) dietParam = "&diet=low-carb";
 
-  const url = `https://api.spoonacular.com/recipes/findByIngredients?ingredients=${ingredients.join(",")}&number=5&ranking=2&ignorePantry=true${dietParam}&apiKey=${process.env.SPOONACULAR_API_KEY}`;
+  const apiKey = process.env.SPOONACULAR_API_KEY;
+  if (!apiKey) return { error: "missing_spoonacular_api_key" };
 
-  const response = await fetch(url);
-  const recipes = await response.json();
+  const url = `https://api.spoonacular.com/recipes/findByIngredients?ingredients=${encodeURIComponent(
+    ingredients.join(",")
+  )}&number=5&ranking=2&ignorePantry=true${dietParam}&apiKey=${apiKey}`;
+
+  let recipes;
+  try {
+    recipes = await fetchJsonWithTimeout(url);
+  } catch (err) {
+    console.error("[tool] search_recipes failed:", err.message);
+    return { error: "spoonacular_search_failed", message: err.message };
+  }
 
   if (!recipes || recipes.length === 0) {
     return { error: "No recipes found" };
@@ -172,10 +289,18 @@ async function handleSearchRecipes({ ingredients, phone }) {
 
 async function handleGetRecipeDetails({ recipe_id }) {
   console.log(`[tool] get_recipe_details for ${recipe_id}`);
-  const url = `https://api.spoonacular.com/recipes/${recipe_id}/information?includeNutrition=true&apiKey=${process.env.SPOONACULAR_API_KEY}`;
+  const apiKey = process.env.SPOONACULAR_API_KEY;
+  if (!apiKey) return { error: "missing_spoonacular_api_key" };
 
-  const response = await fetch(url);
-  const recipe = await response.json();
+  const url = `https://api.spoonacular.com/recipes/${recipe_id}/information?includeNutrition=true&apiKey=${apiKey}`;
+
+  let recipe;
+  try {
+    recipe = await fetchJsonWithTimeout(url);
+  } catch (err) {
+    console.error("[tool] get_recipe_details failed:", err.message);
+    return { error: "spoonacular_details_failed", message: err.message };
+  }
 
   const steps =
     recipe.analyzedInstructions?.[0]?.steps?.map((s) => s.step).join(" ") ||
@@ -197,27 +322,51 @@ async function handleGetRecipeDetails({ recipe_id }) {
   };
 }
 
-async function handleSendRecipeSms({ phone, recipe_name, instructions, cook_time }) {
-  const normalized = normalizePhone(phone);
-  const target = normalized || lastWebhookCallerPhone;
+async function handleSendRecipeSms({ phone, call_id, recipe_name, instructions, cook_time }) {
+  const target = resolvePhone({ phone, call_id });
   console.log(`[tool] send_recipe_sms to ${target}`);
   if (!target) {
     return { sent: false, error: "missing_phone" };
   }
   const message = `🍳 ${recipe_name}${cook_time ? ` (${cook_time})` : ""}\n\n${instructions}\n\n— Fridge Friend`;
+  const rawFrom = process.env.TELNYX_FROM_PHONE_NUMBER || process.env.TELNYX_PHONE_NUMBER || "";
+  const fromNumber = normalizePhone(rawFrom);
+  console.log(`[tools/send_recipe_sms] fromUsed=${fromNumber || rawFrom || "(empty)"}`);
+  if (!fromNumber) {
+    return { sent: false, error: "invalid_sender_number" };
+  }
 
-  const response = await fetch("https://api.telnyx.com/v2/messages", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "Authorization": `Bearer ${process.env.TELNYX_API_KEY}`,
-    },
-    body: JSON.stringify({
-      from: process.env.TELNYX_PHONE_NUMBER,
-      to: target,
-      text: message,
-    }),
-  });
+  const telnyxApiKey = process.env.TELNYX_API_KEY;
+  if (!telnyxApiKey) {
+    return { sent: false, error: "missing_telnyx_api_key" };
+  }
+
+  const dedupeKey = buildSmsDedupeKey({ recipe_name, instructions });
+  const existing = smsSuccessByPhone[target];
+  if (existing && existing.key === dedupeKey && Date.now() - existing.sentAtMs < 10 * 60 * 1000) {
+    return { sent: true, to: target, deduped: true };
+  }
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 12000);
+  let response;
+  try {
+    response = await fetch("https://api.telnyx.com/v2/messages", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${telnyxApiKey}`,
+      },
+      body: JSON.stringify({
+        from: fromNumber,
+        to: target,
+        text: message,
+      }),
+      signal: controller.signal,
+    });
+  } finally {
+    clearTimeout(timeout);
+  }
 
   const success = response.ok;
   let errorBody = "";
@@ -233,16 +382,22 @@ async function handleSendRecipeSms({ phone, recipe_name, instructions, cook_time
   console.log(
     `[tool] SMS to ${target}: ${success ? "sent" : "failed"}${!success ? ` (${response.status}) ${errorBody}` : ""}`
   );
-  return { sent: success, to: target };
+  if (!success) {
+    // Force the agent to handle failures instead of confidently claiming success.
+    throw new Error(`telnyx_sms_failed (${response.status}): ${errorBody || "unknown_error"}`);
+  }
+
+  smsSuccessByPhone[target] = { key: dedupeKey, sentAtMs: Date.now() };
+  return { sent: true, to: target, deduped: false };
 }
 
-async function handleSavePreference({ phone, meal_name, liked, dietary, low_carb, high_protein }) {
-  const normalized = normalizePhone(phone);
-  const target = normalized || lastWebhookCallerPhone;
+async function handleSavePreference({ phone, call_id, meal_name, liked, dietary, low_carb, high_protein }) {
+  const target = resolvePhone({ phone, call_id });
   console.log(`[tool] save_preference for ${target}: ${meal_name}`);
   if (!target) {
     return { saved: false, error: "missing_phone" };
   }
+  const likedBool = coerceBoolean(liked);
 
   if (!userStore[target]) {
     userStore[target] = { callCount: 0, lastMeal: "", preferences: {}, likedMeals: [] };
@@ -251,7 +406,7 @@ async function handleSavePreference({ phone, meal_name, liked, dietary, low_carb
   const user = userStore[target];
   user.lastMeal = meal_name;
   user.callCount += 1;
-  if (liked) user.likedMeals.push(meal_name);
+  if (likedBool && !user.likedMeals.includes(meal_name)) user.likedMeals.push(meal_name);
   if (dietary) user.preferences.dietary = dietary;
   if (low_carb !== undefined) user.preferences.wantLowCarb = low_carb;
   if (high_protein !== undefined) user.preferences.wantHighProtein = high_protein;
@@ -269,7 +424,8 @@ app.post("/tools/get_user_history", async (req, res) => {
   try {
     const extracted = extractPhoneFromRequest(req);
     const phone = normalizePhone(req.body?.phone) || extracted;
-    const result = await handleGetUserHistory({ phone });
+    const call_id = req.body?.call_id || req.body?.conversation_id || extractCallIdFromRequest(req);
+    const result = await handleGetUserHistory({ phone, call_id });
     res.json(result);
   } catch (err) {
     console.error("[tools/get_user_history] error:", err.message);
@@ -283,7 +439,8 @@ app.post("/tools/search_recipes", async (req, res) => {
     const params = req.body?.parameters || req.body?.input || req.body || {};
     const extracted = extractPhoneFromRequest(req);
     const phone = normalizePhone(params?.phone) || extracted;
-    const result = await handleSearchRecipes({ ...params, ingredients: params.ingredients, phone });
+    const call_id = params?.call_id || params?.conversation_id || extractCallIdFromRequest(req);
+    const result = await handleSearchRecipes({ ...params, ingredients: params.ingredients, phone, call_id });
     res.json(result);
   } catch (err) {
     console.error("[tools/search_recipes] error:", err.message);
@@ -306,8 +463,9 @@ app.post("/tools/send_recipe_sms", async (req, res) => {
     console.log("[tools/send_recipe_sms] body:", JSON.stringify(req.body));
     const extracted = extractPhoneFromRequest(req);
     const phone = normalizePhone(req.body?.phone) || extracted;
+    const call_id = req.body?.call_id || req.body?.conversation_id || extractCallIdFromRequest(req);
     console.log(`[tools/send_recipe_sms] extracted=${extracted} normalizedPhone=${normalizePhone(req.body?.phone)} phoneArg=${req.body?.phone} phoneUsed=${phone}`);
-    const result = await handleSendRecipeSms({ ...req.body, phone });
+    const result = await handleSendRecipeSms({ ...req.body, phone, call_id });
     res.json(result);
   } catch (err) {
     console.error("[tools/send_recipe_sms] error:", err.message);
@@ -319,7 +477,8 @@ app.post("/tools/save_preference", async (req, res) => {
   try {
     const extracted = extractPhoneFromRequest(req);
     const phone = normalizePhone(req.body?.phone) || extracted;
-    const result = await handleSavePreference({ ...req.body, phone });
+    const call_id = req.body?.call_id || req.body?.conversation_id || extractCallIdFromRequest(req);
+    const result = await handleSavePreference({ ...req.body, phone, call_id });
     res.json(result);
   } catch (err) {
     console.error("[tools/save_preference] error:", err.message);
@@ -338,15 +497,16 @@ function getMcpServer() {
   server.tool("get_user_history", "Get the full history and dietary preferences for a caller",
     {
       phone: z.string().optional().describe("Caller phone number"),
+      call_id: z.string().optional().describe("Telnyx call/conversation id"),
       from: z.string().optional().describe("Caller phone number (alt field)"),
       caller_id: z.string().optional().describe("Caller phone number (alt field)"),
       caller_phone: z.string().optional().describe("Caller phone number (alt field)"),
       callerPhone: z.string().optional().describe("Caller phone number (alt field)"),
     },
-    async ({ phone, from, caller_id, caller_phone, callerPhone }) => {
+    async ({ phone, call_id, from, caller_id, caller_phone, callerPhone }) => {
       const normalized = normalizePhone(phone) || normalizePhone(from) || normalizePhone(caller_id) || normalizePhone(caller_phone) || normalizePhone(callerPhone);
       return {
-        content: [{ type: "text", text: JSON.stringify(await handleGetUserHistory({ phone: normalized }), null, 2) }],
+        content: [{ type: "text", text: JSON.stringify(await handleGetUserHistory({ phone: normalized, call_id }), null, 2) }],
       };
     }
   );
@@ -355,12 +515,13 @@ function getMcpServer() {
     {
       ingredients: z.array(z.string()).describe("Ingredients the caller has"),
       phone: z.string().optional().describe("Caller phone number to apply dietary filters"),
+      call_id: z.string().optional().describe("Telnyx call/conversation id"),
       from: z.string().optional().describe("Caller phone number (alt field)"),
     },
-    async ({ ingredients, phone, from }) => {
+    async ({ ingredients, phone, call_id, from }) => {
       const normalized = normalizePhone(phone) || normalizePhone(from);
       return {
-        content: [{ type: "text", text: JSON.stringify(await handleSearchRecipes({ ingredients, phone: normalized }), null, 2) }],
+        content: [{ type: "text", text: JSON.stringify(await handleSearchRecipes({ ingredients, phone: normalized, call_id }), null, 2) }],
       };
     }
   );
@@ -375,15 +536,16 @@ function getMcpServer() {
   server.tool("send_recipe_sms", "Text the full recipe instructions to the caller's phone number",
     {
       phone: z.string().optional().describe("Caller phone number"),
+      call_id: z.string().optional().describe("Telnyx call/conversation id"),
       from: z.string().optional().describe("Caller phone number (alt field)"),
       recipe_name: z.string().describe("Name of the recipe"),
       instructions: z.string().describe("Recipe instructions"),
       cook_time: z.string().optional().describe("Cook time"),
     },
-    async ({ phone, from, recipe_name, instructions, cook_time }) => {
+    async ({ phone, call_id, from, recipe_name, instructions, cook_time }) => {
       const normalized = normalizePhone(phone) || normalizePhone(from);
       return {
-        content: [{ type: "text", text: JSON.stringify(await handleSendRecipeSms({ phone: normalized, recipe_name, instructions, cook_time }), null, 2) }],
+        content: [{ type: "text", text: JSON.stringify(await handleSendRecipeSms({ phone: normalized, call_id, recipe_name, instructions, cook_time }), null, 2) }],
       };
     }
   );
@@ -391,17 +553,18 @@ function getMcpServer() {
   server.tool("save_preference", "Save the caller's meal choice and dietary preferences",
     {
       phone: z.string().optional().describe("Caller phone number"),
+      call_id: z.string().optional().describe("Telnyx call/conversation id"),
       from: z.string().optional().describe("Caller phone number (alt field)"),
       meal_name: z.string().describe("Name of the meal"),
-      liked: z.boolean().describe("Whether the caller liked it"),
+      liked: z.union([z.boolean(), z.string()]).describe("Whether the caller liked it"),
       dietary: z.string().optional().describe("Dietary restriction"),
       low_carb: z.boolean().optional().describe("Wants low carb"),
       high_protein: z.boolean().optional().describe("Wants high protein"),
     },
-    async ({ phone, from, meal_name, liked, dietary, low_carb, high_protein }) => {
+    async ({ phone, call_id, from, meal_name, liked, dietary, low_carb, high_protein }) => {
       const normalized = normalizePhone(phone) || normalizePhone(from);
       return {
-        content: [{ type: "text", text: JSON.stringify(await handleSavePreference({ phone: normalized, meal_name, liked, dietary, low_carb, high_protein }), null, 2) }],
+        content: [{ type: "text", text: JSON.stringify(await handleSavePreference({ phone: normalized, call_id, meal_name, liked, dietary, low_carb, high_protein }), null, 2) }],
       };
     }
   );
