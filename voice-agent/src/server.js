@@ -233,10 +233,31 @@ app.get("/", (req, res) => {
 // {{greeting_type}}, {{last_meal}}, {{dietary_restrictions}} etc.
 // ============================================================
 app.post("/webhook", (req, res) => {
-  const callerPhone = extractPhoneFromRequest(req);
+  let callerPhone = extractPhoneFromRequest(req);
   const callId = extractCallIdFromRequest(req);
+
+  // Sometimes Telnyx sends a webhook event where phone extraction fails, but
+  // we already captured the phone for this call_id earlier.
+  if (!callerPhone && callId && callContextStore[callId]?.phone) {
+    callerPhone = callContextStore[callId].phone;
+  }
+
   const existingUser = callerPhone ? userStore[callerPhone] : undefined;
   const isReturning = !!(existingUser && existingUser.callCount > 0);
+
+  if (!callerPhone) {
+    // Helpful for diagnosing why greeting_type is coming back "new".
+    // Redact potential signature fields.
+    const redactedHeaders = Object.fromEntries(
+      Object.entries(req.headers || {}).map(([k, v]) => {
+        if (k.toLowerCase().includes("signature")) return [k, "(redacted)"];
+        return [k, v];
+      })
+    );
+    console.log(
+      "[webhook][debug] callerPhone empty. body=" + JSON.stringify(req.body || {}) + " headers=" + JSON.stringify(redactedHeaders)
+    );
+  }
 
   // Increment call count at call start so "returning" greeting works even
   // if the caller doesn't accept SMS (which is when save_preference runs).
