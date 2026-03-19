@@ -80,6 +80,10 @@ function extractPhoneFromRequest(req) {
     headers["x-caller-phone"],
     headers["x-telnyx-from"],
     headers["x-telnyx-caller-phone"],
+    headers["x-telnyx-caller-id"],
+    headers["x-caller-id"],
+    headers["x-phone-number"],
+    headers["x-telnyx-phone-number"],
   ];
 
   for (const c of candidates) {
@@ -124,6 +128,9 @@ function extractCallIdFromRequest(req) {
     headers["x-telnyx-call-control-id"],
     headers["x-telnyx-call-id"],
     headers["x-conversation-id"],
+    headers["x-telnyx-conversation-id"],
+    headers["x-session-id"],
+    headers["x-telnyx-session-id"],
   ];
 
   for (const c of candidates) {
@@ -328,7 +335,17 @@ async function handleSendRecipeSms({ phone, call_id, recipe_name, instructions, 
   if (!target) {
     return { sent: false, error: "missing_phone" };
   }
-  const message = `🍳 ${recipe_name}${cook_time ? ` (${cook_time})` : ""}\n\n${instructions}\n\n— Fridge Friend`;
+  // No emoji — keeps the message ASCII so each SMS part holds 153 chars (vs 67
+  // for Unicode). 10-part limit × 153 = 1530 chars total budget.
+  const MAX_MSG_CHARS = 1530;
+  const header = `${recipe_name}${cook_time ? ` (${cook_time})` : ""}\n\n`;
+  const footer = `\n\n— Fridge Friend`;
+  const instructionBudget = MAX_MSG_CHARS - header.length - footer.length;
+  const trimmedInstructions =
+    instructions.length > instructionBudget
+      ? instructions.slice(0, instructionBudget - 3).trimEnd() + "..."
+      : instructions;
+  const message = `${header}${trimmedInstructions}${footer}`;
   const rawFrom = process.env.TELNYX_FROM_PHONE_NUMBER || process.env.TELNYX_PHONE_NUMBER || "";
   const fromNumber = normalizePhone(rawFrom);
   console.log(`[tools/send_recipe_sms] fromUsed=${fromNumber || rawFrom || "(empty)"}`);
@@ -423,8 +440,10 @@ async function handleSavePreference({ phone, call_id, meal_name, liked, dietary,
 app.post("/tools/get_user_history", async (req, res) => {
   try {
     const extracted = extractPhoneFromRequest(req);
-    const phone = normalizePhone(req.body?.phone) || extracted;
     const call_id = req.body?.call_id || req.body?.conversation_id || extractCallIdFromRequest(req);
+    const phoneFromBody = normalizePhone(req.body?.phone);
+    const phoneFromCallCtx = call_id ? callContextStore[call_id]?.phone : "";
+    const phone = phoneFromBody || extracted || phoneFromCallCtx || "";
     const result = await handleGetUserHistory({ phone, call_id });
     res.json(result);
   } catch (err) {
@@ -438,8 +457,10 @@ app.post("/tools/search_recipes", async (req, res) => {
     console.log("[tools/search_recipes] body:", JSON.stringify(req.body));
     const params = req.body?.parameters || req.body?.input || req.body || {};
     const extracted = extractPhoneFromRequest(req);
-    const phone = normalizePhone(params?.phone) || extracted;
     const call_id = params?.call_id || params?.conversation_id || extractCallIdFromRequest(req);
+    const phoneFromBody = normalizePhone(params?.phone);
+    const phoneFromCallCtx = call_id ? callContextStore[call_id]?.phone : "";
+    const phone = phoneFromBody || extracted || phoneFromCallCtx || "";
     const result = await handleSearchRecipes({ ...params, ingredients: params.ingredients, phone, call_id });
     res.json(result);
   } catch (err) {
@@ -461,10 +482,22 @@ app.post("/tools/get_recipe_details", async (req, res) => {
 app.post("/tools/send_recipe_sms", async (req, res) => {
   try {
     console.log("[tools/send_recipe_sms] body:", JSON.stringify(req.body));
+    const relevantHeaders = Object.fromEntries(
+      Object.entries(req.headers).filter(([k]) =>
+        k !== "authorization" &&
+        (k.startsWith("x-") || ["from", "caller", "phone", "call", "telnyx", "conversation", "session"].some(kw => k.includes(kw)))
+      )
+    );
+    if (Object.keys(relevantHeaders).length) {
+      console.log("[tools/send_recipe_sms] headers:", JSON.stringify(relevantHeaders));
+    }
     const extracted = extractPhoneFromRequest(req);
-    const phone = normalizePhone(req.body?.phone) || extracted;
     const call_id = req.body?.call_id || req.body?.conversation_id || extractCallIdFromRequest(req);
-    console.log(`[tools/send_recipe_sms] extracted=${extracted} normalizedPhone=${normalizePhone(req.body?.phone)} phoneArg=${req.body?.phone} phoneUsed=${phone}`);
+    // Prefer explicit phone from body; fall back to header extraction; then call context store
+    const phoneFromBody = normalizePhone(req.body?.phone);
+    const phoneFromCallCtx = call_id ? callContextStore[call_id]?.phone : "";
+    const phone = phoneFromBody || extracted || phoneFromCallCtx || "";
+    console.log(`[tools/send_recipe_sms] extracted=${extracted} callCtxPhone=${phoneFromCallCtx} phoneArg=${req.body?.phone} phoneUsed=${phone}`);
     const result = await handleSendRecipeSms({ ...req.body, phone, call_id });
     res.json(result);
   } catch (err) {
@@ -476,8 +509,10 @@ app.post("/tools/send_recipe_sms", async (req, res) => {
 app.post("/tools/save_preference", async (req, res) => {
   try {
     const extracted = extractPhoneFromRequest(req);
-    const phone = normalizePhone(req.body?.phone) || extracted;
     const call_id = req.body?.call_id || req.body?.conversation_id || extractCallIdFromRequest(req);
+    const phoneFromBody = normalizePhone(req.body?.phone);
+    const phoneFromCallCtx = call_id ? callContextStore[call_id]?.phone : "";
+    const phone = phoneFromBody || extracted || phoneFromCallCtx || "";
     const result = await handleSavePreference({ ...req.body, phone, call_id });
     res.json(result);
   } catch (err) {
