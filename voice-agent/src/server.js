@@ -7,6 +7,9 @@ const { z } = require("zod");
 // phone -> { callCount, lastMeal, preferences: { dietary, wantLowCarb, wantHighProtein }, likedMeals[] }
 // In production this would be a real database like PostgreSQL
 const userStore = {};
+// Fallback for tool calls that arrive without a real phone number.
+// This relies on the assumption of one active call flow at a time.
+let lastWebhookCallerPhone = "";
 
 // --- Express app
 const app = express();
@@ -82,6 +85,7 @@ app.post("/webhook", (req, res) => {
   const user = userStore[callerPhone];
 
   console.log(`[webhook] call from ${callerPhone}`);
+  if (callerPhone) lastWebhookCallerPhone = callerPhone;
 
   const preferences = user?.preferences || {};
 
@@ -182,7 +186,8 @@ async function handleGetRecipeDetails({ recipe_id }) {
 async function handleSendRecipeSms({ phone, recipe_name, instructions, cook_time }) {
   const normalized = normalizePhone(phone);
   console.log(`[tool] send_recipe_sms to ${normalized || phone}`);
-  if (!normalized) {
+  const target = normalized || lastWebhookCallerPhone;
+  if (!target) {
     return { sent: false, error: "missing_phone" };
   }
   const message = `🍳 ${recipe_name}${cook_time ? ` (${cook_time})` : ""}\n\n${instructions}\n\n— Fridge Friend`;
@@ -195,7 +200,7 @@ async function handleSendRecipeSms({ phone, recipe_name, instructions, cook_time
     },
     body: JSON.stringify({
       from: process.env.TELNYX_PHONE_NUMBER,
-      to: normalized,
+      to: target,
       text: message,
     }),
   });
@@ -208,15 +213,16 @@ async function handleSendRecipeSms({ phone, recipe_name, instructions, cook_time
 async function handleSavePreference({ phone, meal_name, liked, dietary, low_carb, high_protein }) {
   const normalized = normalizePhone(phone);
   console.log(`[tool] save_preference for ${normalized || phone}: ${meal_name}`);
-  if (!normalized) {
+  const target = normalized || lastWebhookCallerPhone;
+  if (!target) {
     return { saved: false, error: "missing_phone" };
   }
 
-  if (!userStore[normalized]) {
-    userStore[normalized] = { callCount: 0, lastMeal: "", preferences: {}, likedMeals: [] };
+  if (!userStore[target]) {
+    userStore[target] = { callCount: 0, lastMeal: "", preferences: {}, likedMeals: [] };
   }
 
-  const user = userStore[normalized];
+  const user = userStore[target];
   user.lastMeal = meal_name;
   user.callCount += 1;
   if (liked) user.likedMeals.push(meal_name);
