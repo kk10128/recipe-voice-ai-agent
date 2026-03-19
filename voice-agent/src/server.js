@@ -221,10 +221,14 @@ async function handleSendRecipeSms({ phone, recipe_name, instructions, cook_time
 
   const success = response.ok;
   let errorBody = "";
-  try {
-    errorBody = !success ? await response.text() : "";
-  } catch (e) {
-    errorBody = "";
+  if (!success) {
+    try {
+      // Telnyx errors are often JSON; fall back to text if needed.
+      errorBody = await response.text();
+    } catch (e) {
+      errorBody = "";
+    }
+    if (errorBody && errorBody.length > 800) errorBody = errorBody.slice(0, 800) + "...";
   }
   console.log(
     `[tool] SMS to ${target}: ${success ? "sent" : "failed"}${!success ? ` (${response.status}) ${errorBody}` : ""}`
@@ -299,8 +303,10 @@ app.post("/tools/get_recipe_details", async (req, res) => {
 
 app.post("/tools/send_recipe_sms", async (req, res) => {
   try {
+    console.log("[tools/send_recipe_sms] body:", JSON.stringify(req.body));
     const extracted = extractPhoneFromRequest(req);
     const phone = normalizePhone(req.body?.phone) || extracted;
+    console.log(`[tools/send_recipe_sms] extracted=${extracted} normalizedPhone=${normalizePhone(req.body?.phone)} phoneArg=${req.body?.phone} phoneUsed=${phone}`);
     const result = await handleSendRecipeSms({ ...req.body, phone });
     res.json(result);
   } catch (err) {
