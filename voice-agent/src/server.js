@@ -49,6 +49,8 @@ const CALL_CONTEXT_SWEEP_MS = 5 * 60 * 1000;
 const recentToolResults = {};
 const inFlightToolResults = {};
 const TOOL_DEDUPE_WINDOW_MS = 8000;
+const recentMcpRequests = new Map();
+const MCP_DEDUPE_WINDOW_MS = 3000;
 
 function coerceBoolean(value) {
   if (typeof value === "boolean") return value;
@@ -555,6 +557,25 @@ app.get("/mcp", (req, res) => {
 
 // MCP tool calls (POST)
 app.post("/mcp", async (req, res) => {
+  const method = req.body?.method || "";
+  const toolName = req.body?.params?.name || "";
+  const toolArgs = req.body?.params?.arguments || {};
+  const dedupeKey = `${method}:${toolName}:${JSON.stringify(toolArgs)}`;
+  const now = Date.now();
+
+  const lastSeen = recentMcpRequests.get(dedupeKey);
+  if (lastSeen && now - lastSeen < MCP_DEDUPE_WINDOW_MS) {
+    return res.json({
+      jsonrpc: "2.0",
+      result: { content: [{ type: "text", text: "{\"dedup\":true}" }] },
+      id: req.body?.id ?? null,
+    });
+  }
+  recentMcpRequests.set(dedupeKey, now);
+  for (const [key, ts] of recentMcpRequests.entries()) {
+    if (now - ts > 10000) recentMcpRequests.delete(key);
+  }
+
   const server = getMcpServer();
   const transport = new StreamableHTTPServerTransport({
     sessionIdGenerator: undefined,
