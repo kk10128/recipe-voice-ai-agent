@@ -49,6 +49,9 @@ const CALL_CONTEXT_SWEEP_MS = 5 * 60 * 1000;
 const recentToolResults = {};
 const inFlightToolResults = {};
 const TOOL_DEDUPE_WINDOW_MS = 8000;
+const SAVE_PREF_DEDUPE_MS = 15000;
+const recentSavePreferences = {};
+const inFlightSavePreferences = {};
 
 // ============================================================
 // DUPLICATE RESPONSE DEDUP (fixes double-fire from Telnyx)
@@ -433,20 +436,51 @@ async function handleSavePreference({ phone, call_id, meal_name, liked, dietary,
   }
 
   const likedBool = coerceBoolean(liked);
-  if (!userStore[target]) {
-    userStore[target] = { callCount: 0, lastMeal: "", preferences: {}, likedMeals: [] };
+
+  const prefKey = [
+    target,
+    String(meal_name || "").trim().toLowerCase(),
+    likedBool ? "liked" : "not-liked",
+    dietary ? String(dietary).trim().toLowerCase() : "",
+    low_carb !== undefined ? `lowcarb:${low_carb}` : "",
+    high_protein !== undefined ? `hip:${high_protein}` : "",
+  ].join("|");
+
+  const now = Date.now();
+  const prev = recentSavePreferences[prefKey];
+  if (prev && now - prev < SAVE_PREF_DEDUPE_MS) {
+    const user = userStore[target];
+    return { saved: true, ...user };
   }
 
-  const user = userStore[target];
-  user.lastMeal = meal_name;
-  if (likedBool && !user.likedMeals.includes(meal_name)) user.likedMeals.push(meal_name);
-  if (dietary) user.preferences.dietary = dietary;
-  if (low_carb !== undefined) user.preferences.wantLowCarb = low_carb;
-  if (high_protein !== undefined) user.preferences.wantHighProtein = high_protein;
+  if (inFlightSavePreferences[prefKey]) {
+    return await inFlightSavePreferences[prefKey];
+  }
 
-  saveUserStore();
-  console.log(`[save_preference] ✅ saved "${meal_name}" for ${target}`);
-  return { saved: true, ...user };
+  const run = (async () => {
+    if (!userStore[target]) {
+      userStore[target] = { callCount: 0, lastMeal: "", preferences: {}, likedMeals: [] };
+    }
+
+    const user = userStore[target];
+    user.lastMeal = meal_name;
+    if (likedBool && !user.likedMeals.includes(meal_name)) user.likedMeals.push(meal_name);
+    if (dietary) user.preferences.dietary = dietary;
+    if (low_carb !== undefined) user.preferences.wantLowCarb = low_carb;
+    if (high_protein !== undefined) user.preferences.wantHighProtein = high_protein;
+
+    saveUserStore();
+    console.log(`[save_preference] ✅ saved "${meal_name}" for ${target}`);
+    recentSavePreferences[prefKey] = Date.now();
+    return { saved: true, ...userStore[target] };
+  })();
+
+  inFlightSavePreferences[prefKey] = run;
+  try {
+    return await run;
+  } finally {
+    delete inFlightSavePreferences[prefKey];
+  }
 }
 
 // ============================================================
@@ -607,7 +641,6 @@ function getMcpServer() {
 
       const ingKey = searchRecipesIngredientKey(ingredients);
       if (isDuplicateSearchRequest(ingKey)) {
-        console.log(`[mcp/search_recipes] 🚫 duplicate blocked for: ${ingKey}`);
         return {
           content: [{ type: "text", text: JSON.stringify({ error: "duplicate_request" }, null, 2) }],
         };
