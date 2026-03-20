@@ -327,7 +327,6 @@ async function handleGetRecipeDetails({ recipe_id }) {
 async function handleSavePreference({ phone, call_id, meal_name, liked, dietary, low_carb, high_protein }) {
   const target = resolvePhone({ phone, call_id });
   if (!target) {
-    console.warn(`[save_preference] ❌ failed — could not resolve phone`);
     return { saved: false, error: "missing_phone" };
   }
 
