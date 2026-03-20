@@ -5,12 +5,7 @@ const { McpServer } = require("@modelcontextprotocol/sdk/server/mcp.js");
 const { StreamableHTTPServerTransport } = require("@modelcontextprotocol/sdk/server/streamableHttp.js");
 const { z } = require("zod");
 
-// --- Persistent user store backed by a JSON file.
-// phone -> { callCount, lastMeal, preferences: { dietary, wantLowCarb, wantHighProtein }, likedMeals[] }
-// Survives server restarts. For true cross-deployment persistence attach a
-// Railway volume at /data and set USER_STORE_PATH=/data/users.json.
 const LOCAL_USER_STORE_PATH = path.join(__dirname, "../../users.json");
-// Prefer Railway's persistent volume mount point if present.
 const DEFAULT_USER_STORE_PATH = "/data/users.json";
 const USER_STORE_PATH =
   process.env.USER_STORE_PATH ||
@@ -21,7 +16,6 @@ function loadUserStore() {
   try {
     if (fs.existsSync(USER_STORE_PATH)) {
       const data = JSON.parse(fs.readFileSync(USER_STORE_PATH, "utf8"));
-      // Re-key phone numbers into a consistent "+E164" format.
       for (const [rawKey, value] of Object.entries(data)) {
         const keyStr = String(rawKey);
         if (keyStr.includes("{{") && keyStr.includes("}}")) continue;
@@ -29,12 +23,12 @@ function loadUserStore() {
         if (digits.length < 7) continue;
         userStore[`+${digits}`] = value;
       }
-      console.log(`[store] loaded ${Object.keys(data).length} user(s) from ${USER_STORE_PATH}`);
+      console.log(`[store] loaded ${Object.keys(data).length} user(s)`);
     } else {
-      console.log(`[store] no existing user store at ${USER_STORE_PATH} (starting fresh)`);
+      console.log(`[store] starting fresh`);
     }
   } catch (err) {
-    console.error("[store] failed to load user store:", err.message);
+    console.error("[store] failed to load:", err.message);
   }
 }
 
@@ -43,13 +37,12 @@ function saveUserStore() {
     fs.mkdirSync(path.dirname(USER_STORE_PATH), { recursive: true });
     fs.writeFileSync(USER_STORE_PATH, JSON.stringify(userStore, null, 2));
   } catch (err) {
-    console.error("[store] failed to save user store:", err.message);
+    console.error("[store] failed to save:", err.message);
   }
 }
 
 loadUserStore();
-// Per-call context so tool calls don't rely on global "last caller" state.
-// call_id -> { phone }
+
 const callContextStore = {};
 const CALL_CONTEXT_TTL_MS = 30 * 60 * 1000;
 const CALL_CONTEXT_SWEEP_MS = 5 * 60 * 1000;
@@ -65,7 +58,6 @@ function coerceBoolean(value) {
   return false;
 }
 
-// --- Express app
 const app = express();
 app.use(express.json());
 
@@ -74,51 +66,29 @@ function normalizePhone(value) {
   if (typeof value !== "string") return "";
   const trimmed = value.trim();
   if (!trimmed) return "";
-  // If templating didn't run, we might get literal placeholders.
   if (trimmed.includes("{{") && trimmed.includes("}}")) return "";
   const lower = trimmed.toLowerCase();
   if (lower === "null" || lower === "undefined") return "";
-
   const digits = trimmed.replace(/\D/g, "");
   if (digits.length < 7) return "";
-  // Always key by '+digits' so we don't split users into '147...' vs '+147...'.
   return `+${digits}`;
 }
 
 function extractPhoneFromRequest(req) {
   const body = req?.body || {};
   const headers = req?.headers || {};
-
   const candidates = [
-    body.from,
-    body.caller_id,
-    body.callerPhone,
-    body.caller_phone,
-    body.phone,
-    body.from_number,
-    body.fromNumber,
-    // Common Telnyx-ish nesting shapes
-    body?.data?.from,
-    body?.data?.caller_id,
-    body?.data?.payload?.from,
-    body?.data?.payload?.caller_id,
-    body?.data?.payload?.from_number,
-    body?.data?.payload?.fromNumber,
-    body?.payload?.from,
-    body?.payload?.caller_id,
-    body?.payload?.from_number,
-    body?.payload?.fromNumber,
-    // Common headers (best-effort)
-    headers["x-from"],
-    headers["x-caller-phone"],
-    headers["x-telnyx-from"],
-    headers["x-telnyx-caller-phone"],
-    headers["x-telnyx-caller-id"],
-    headers["x-caller-id"],
-    headers["x-phone-number"],
-    headers["x-telnyx-phone-number"],
+    body.from, body.caller_id, body.callerPhone, body.caller_phone, body.phone,
+    body.from_number, body.fromNumber,
+    body?.data?.from, body?.data?.caller_id,
+    body?.data?.payload?.from, body?.data?.payload?.caller_id,
+    body?.data?.payload?.from_number, body?.data?.payload?.fromNumber,
+    body?.payload?.from, body?.payload?.caller_id,
+    body?.payload?.from_number, body?.payload?.fromNumber,
+    headers["x-from"], headers["x-caller-phone"], headers["x-telnyx-from"],
+    headers["x-telnyx-caller-phone"], headers["x-telnyx-caller-id"],
+    headers["x-caller-id"], headers["x-phone-number"], headers["x-telnyx-phone-number"],
   ];
-
   for (const c of candidates) {
     const p = normalizePhone(c);
     if (p) return p;
@@ -131,7 +101,6 @@ function normalizeCallId(value) {
   if (typeof value !== "string") return "";
   const trimmed = value.trim();
   if (!trimmed) return "";
-  // If templating didn't run, we might get literal placeholders.
   if (trimmed.includes("{{") && trimmed.includes("}}")) return "";
   return trimmed;
 }
@@ -139,33 +108,18 @@ function normalizeCallId(value) {
 function extractCallIdFromRequest(req) {
   const body = req?.body || {};
   const headers = req?.headers || {};
-
   const candidates = [
-    body.call_control_id,
-    body.callControlId,
-    body.call_id,
-    body.callId,
-    body.conversation_id,
-    body.conversationId,
-    // Common Telnyx-ish nesting shapes
-    body?.data?.call_control_id,
-    body?.data?.callId,
-    body?.data?.payload?.call_control_id,
-    body?.data?.payload?.callId,
-    body?.payload?.call_control_id,
-    body?.payload?.callId,
+    body.call_control_id, body.callControlId, body.call_id, body.callId,
+    body.conversation_id, body.conversationId,
+    body?.data?.call_control_id, body?.data?.callId,
+    body?.data?.payload?.call_control_id, body?.data?.payload?.callId,
+    body?.payload?.call_control_id, body?.payload?.callId,
     body?.payload?.conversation_id,
-    // Common headers (best-effort)
-    headers["x-call-control-id"],
-    headers["x-call-id"],
-    headers["x-telnyx-call-control-id"],
-    headers["x-telnyx-call-id"],
-    headers["x-conversation-id"],
-    headers["x-telnyx-conversation-id"],
-    headers["x-session-id"],
-    headers["x-telnyx-session-id"],
+    headers["x-call-control-id"], headers["x-call-id"],
+    headers["x-telnyx-call-control-id"], headers["x-telnyx-call-id"],
+    headers["x-conversation-id"], headers["x-telnyx-conversation-id"],
+    headers["x-session-id"], headers["x-telnyx-session-id"],
   ];
-
   for (const c of candidates) {
     const id = normalizeCallId(c);
     if (id) return id;
@@ -176,17 +130,14 @@ function extractCallIdFromRequest(req) {
 function resolvePhone({ phone, call_id }) {
   const normalizedPhone = normalizePhone(phone);
   if (normalizedPhone) return normalizedPhone;
-
   const normalizedCallId = normalizeCallId(call_id);
   if (normalizedCallId) {
     const ctx = callContextStore[normalizedCallId];
     if (ctx?.phone) {
-      // Touch on read to keep active calls alive.
       ctx.updatedAtMs = Date.now();
       return ctx.phone;
     }
   }
-
   return "";
 }
 
@@ -199,15 +150,12 @@ function pruneCallContextStore() {
       removed += 1;
     }
   }
-  if (removed > 0) {
-    console.log(`[call-context] pruned ${removed} stale entr${removed === 1 ? "y" : "ies"}`);
-  }
+  if (removed > 0) console.log(`[call-context] pruned ${removed} stale entr${removed === 1 ? "y" : "ies"}`);
 }
 
 async function fetchJsonWithTimeout(url, { timeoutMs = 12000, ...options } = {}) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
-
   try {
     const response = await fetch(url, { ...options, signal: controller.signal });
     if (response.ok) {
@@ -218,14 +166,11 @@ async function fetchJsonWithTimeout(url, { timeoutMs = 12000, ...options } = {})
         throw new Error(`upstream_non_json_success (${response.status})`);
       }
     }
-
     const text = await response.text();
     const excerpt = text ? text.slice(0, 700) : "";
     throw new Error(`upstream_error (${response.status}): ${excerpt || "unknown_error"}`);
   } catch (err) {
-    if (err?.name === "AbortError") {
-      throw new Error(`fetch_timeout after ${timeoutMs}ms`);
-    }
+    if (err?.name === "AbortError") throw new Error(`fetch_timeout after ${timeoutMs}ms`);
     throw err;
   } finally {
     clearTimeout(timeout);
@@ -239,16 +184,11 @@ app.get("/", (req, res) => {
 
 // ============================================================
 // DYNAMIC WEBHOOK VARIABLES
-// Telnyx calls this before every conversation starts.
-// Returns caller context injected into the system prompt as
-// {{greeting_type}}, {{last_meal}}, {{dietary_restrictions}} etc.
 // ============================================================
 app.post("/webhook", (req, res) => {
   let callerPhone = extractPhoneFromRequest(req);
   const callId = extractCallIdFromRequest(req);
 
-  // Sometimes Telnyx sends a webhook event where phone extraction fails, but
-  // we already captured the phone for this call_id earlier.
   if (!callerPhone && callId && callContextStore[callId]?.phone) {
     callerPhone = callContextStore[callId].phone;
   }
@@ -256,22 +196,6 @@ app.post("/webhook", (req, res) => {
   const existingUser = callerPhone ? userStore[callerPhone] : undefined;
   const isReturning = !!(existingUser && existingUser.callCount > 0);
 
-  if (!callerPhone) {
-    // Helpful for diagnosing why greeting_type is coming back "new".
-    // Redact potential signature fields.
-    const redactedHeaders = Object.fromEntries(
-      Object.entries(req.headers || {}).map(([k, v]) => {
-        if (k.toLowerCase().includes("signature")) return [k, "(redacted)"];
-        return [k, v];
-      })
-    );
-    console.log(
-      "[webhook][debug] callerPhone empty. body=" + JSON.stringify(req.body || {}) + " headers=" + JSON.stringify(redactedHeaders)
-    );
-  }
-
-  // Increment call count at call start so "returning" greeting works even
-  // if the caller doesn't accept SMS (which is when save_preference runs).
   if (callerPhone) {
     if (!userStore[callerPhone]) {
       userStore[callerPhone] = { callCount: 0, lastMeal: "nothing yet", preferences: {}, likedMeals: [] };
@@ -282,22 +206,17 @@ app.post("/webhook", (req, res) => {
 
   const user = callerPhone ? userStore[callerPhone] : undefined;
 
-  console.log(`[webhook] call from ${callerPhone}`);
   if (callerPhone && callId) {
     callContextStore[callId] = { phone: callerPhone, updatedAtMs: Date.now() };
   }
 
   const preferences = user?.preferences || {};
 
-  console.log(
-    `[webhook] callerPhone=${callerPhone || "(empty)"} callId=${callId || "(empty)"} greeting_type=${
-      isReturning ? "returning" : "new"
-    } previous_callCount=${existingUser?.callCount ?? 0}`
-  );
+  console.log(`[webhook] 📞 call from ${callerPhone || "(unknown)"} — ${isReturning ? "returning caller" : "new caller"}`);
 
   const opening_line = isReturning
     ? `Hey, welcome back! Last time you made ${user?.lastMeal || "something tasty"}. What are you working with tonight?`
-    : "Hey! I'm Fridge Friend. Any dietary restrictions I should know about? Like vegetarian, vegan, gluten free, or low carb?";
+    : "Hey! I'm Fridge Friend — I help you figure out what to cook with whatever's in your fridge. Any dietary restrictions I should know about?";
 
   res.json({
     caller_phone: callerPhone,
@@ -315,26 +234,16 @@ app.post("/webhook", (req, res) => {
 
 // ============================================================
 // TOOL HANDLERS
-// These are the actual functions each tool runs.
-// Shared between the direct /tools/ endpoints and the MCP server.
 // ============================================================
-
 async function handleGetUserHistory({ phone, call_id }) {
   const target = resolvePhone({ phone, call_id });
-  console.log(`[tool] get_user_history for ${target || phone || call_id}`);
+  console.log(`[get_user_history] 👤 looking up ${target || phone || call_id}`);
   const user = target ? userStore[target] : null;
-  return (
-    user || {
-    callCount: 0,
-    lastMeal: "nothing yet",
-    preferences: {},
-    likedMeals: [],
-    }
-  );
+  return user || { callCount: 0, lastMeal: "nothing yet", preferences: {}, likedMeals: [] };
 }
 
 async function handleSearchRecipes({ ingredients, phone, call_id }) {
-  console.log(`[tool] search_recipes for ${ingredients}`);
+  console.log(`[search_recipes] 🔍 ingredients: ${ingredients}`);
   const target = resolvePhone({ phone, call_id });
   const user = target ? userStore[target] : null;
   const dietary = user?.preferences?.dietary || "";
@@ -357,16 +266,16 @@ async function handleSearchRecipes({ ingredients, phone, call_id }) {
   try {
     recipes = await fetchJsonWithTimeout(url);
   } catch (err) {
-    console.error("[tool] search_recipes failed:", err.message);
+    console.error(`[search_recipes] ❌ failed: ${err.message}`);
     return { error: "spoonacular_search_failed", message: err.message };
   }
 
-  if (!recipes || recipes.length === 0) {
-    return { error: "No recipes found" };
-  }
+  if (!recipes || recipes.length === 0) return { error: "No recipes found" };
 
   const filtered = recipes.filter((r) => r.missedIngredientCount === 0);
   const finalRecipes = (filtered.length > 0 ? filtered : recipes).slice(0, 3);
+
+  console.log(`[search_recipes] ✅ found ${finalRecipes.length} result(s)`);
 
   return finalRecipes.map((r, i) => ({
     number: i + 1,
@@ -379,7 +288,7 @@ async function handleSearchRecipes({ ingredients, phone, call_id }) {
 }
 
 async function handleGetRecipeDetails({ recipe_id }) {
-  console.log(`[tool] get_recipe_details for ${recipe_id}`);
+  console.log(`[get_recipe_details] 📖 fetching recipe ${recipe_id}`);
   const apiKey = process.env.SPOONACULAR_API_KEY;
   if (!apiKey) return { error: "missing_spoonacular_api_key" };
 
@@ -389,7 +298,7 @@ async function handleGetRecipeDetails({ recipe_id }) {
   try {
     recipe = await fetchJsonWithTimeout(url);
   } catch (err) {
-    console.error("[tool] get_recipe_details failed:", err.message);
+    console.error(`[get_recipe_details] ❌ failed: ${err.message}`);
     return { error: "spoonacular_details_failed", message: err.message };
   }
 
@@ -404,6 +313,8 @@ async function handleGetRecipeDetails({ recipe_id }) {
       .map((n) => `${n.name}: ${Math.round(n.amount)}${n.unit}`)
       .join(", ") || "Nutrition info unavailable";
 
+  console.log(`[get_recipe_details] ✅ got "${recipe.title}"`);
+
   return {
     name: recipe.title,
     servings: recipe.servings,
@@ -415,15 +326,12 @@ async function handleGetRecipeDetails({ recipe_id }) {
 
 async function handleSavePreference({ phone, call_id, meal_name, liked, dietary, low_carb, high_protein }) {
   const target = resolvePhone({ phone, call_id });
-  console.log(
-    `[tool] save_preference phone=${phone || "(empty)"} call_id=${call_id || "(empty)"} resolved=${target || "(empty)"} meal=${meal_name || "(empty)"}`
-  );
   if (!target) {
-    console.warn("[tool] save_preference FAILED — could not resolve phone");
+    console.warn(`[save_preference] ❌ failed — could not resolve phone`);
     return { saved: false, error: "missing_phone" };
   }
-  const likedBool = coerceBoolean(liked);
 
+  const likedBool = coerceBoolean(liked);
   if (!userStore[target]) {
     userStore[target] = { callCount: 0, lastMeal: "", preferences: {}, likedMeals: [] };
   }
@@ -436,15 +344,13 @@ async function handleSavePreference({ phone, call_id, meal_name, liked, dietary,
   if (high_protein !== undefined) user.preferences.wantHighProtein = high_protein;
 
   saveUserStore();
+  console.log(`[save_preference] ✅ saved "${meal_name}" for ${target}`);
   return { saved: true, ...user };
 }
 
 // ============================================================
 // DIRECT TOOL ENDPOINTS
-// Telnyx webhook tools POST here with plain JSON.
-// Each endpoint calls the shared handler above.
 // ============================================================
-
 app.post("/tools/get_user_history", async (req, res) => {
   try {
     const extracted = extractPhoneFromRequest(req);
@@ -462,7 +368,6 @@ app.post("/tools/get_user_history", async (req, res) => {
 
 app.post("/tools/search_recipes", async (req, res) => {
   try {
-    console.log("[tools/search_recipes] body:", JSON.stringify(req.body));
     const params = req.body?.parameters || req.body?.input || req.body || {};
     const extracted = extractPhoneFromRequest(req);
     const call_id = params?.call_id || params?.conversation_id || extractCallIdFromRequest(req);
@@ -489,15 +394,11 @@ app.post("/tools/get_recipe_details", async (req, res) => {
 
 app.post("/tools/save_preference", async (req, res) => {
   try {
-    console.log("[tools/save_preference] body:", JSON.stringify(req.body));
     const extracted = extractPhoneFromRequest(req);
     const call_id = req.body?.call_id || req.body?.conversation_id || extractCallIdFromRequest(req);
     const phoneFromBody = normalizePhone(req.body?.phone);
     const phoneFromCallCtx = call_id ? callContextStore[call_id]?.phone : "";
     const phone = phoneFromBody || extracted || phoneFromCallCtx || "";
-    console.log(
-      `[tools/save_preference] extracted=${extracted || "(empty)"} call_id=${call_id || "(empty)"} callCtxPhone=${phoneFromCallCtx || "(empty)"} phoneArg=${req.body?.phone || "(empty)"} phoneUsed=${phone || "(empty)"}`
-    );
     const result = await handleSavePreference({ ...req.body, phone, call_id });
     res.json(result);
   } catch (err) {
@@ -508,8 +409,6 @@ app.post("/tools/save_preference", async (req, res) => {
 
 // ============================================================
 // MCP SERVER
-// Satisfies the MCP integration requirement.
-// Uses the same shared handlers above — no duplicated logic.
 // ============================================================
 function getMcpServer() {
   const server = new McpServer({ name: "fridge-to-meal", version: "1.0.0" });
@@ -610,12 +509,17 @@ app.post("/mcp", async (req, res) => {
   }
 });
 
-// Keep-alive ping — prevents Railway from sleeping
+// Keep-alive ping
 setInterval(async () => {
-  await fetch(`https://recipe-voice-ai-agent-production.up.railway.app/`);
+  try {
+    await fetch(`https://recipe-voice-ai-agent-production.up.railway.app/`);
+    console.log("[keep-alive] ping");
+  } catch (err) {
+    console.error("[keep-alive] failed:", err.message);
+  }
 }, 4 * 60 * 1000);
 
-// Prevent unbounded growth of per-call context in long-running servers.
+// Prune stale call context
 setInterval(pruneCallContextStore, CALL_CONTEXT_SWEEP_MS);
 
 const PORT = Number(process.env.PORT) || 3000;
