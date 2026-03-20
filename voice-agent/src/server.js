@@ -69,6 +69,7 @@ function normalizePhone(value) {
   if (typeof value !== "string") return "";
   const trimmed = value.trim();
   if (!trimmed) return "";
+  // Unsubstituted Telnyx template — not a real number
   if (trimmed.includes("{{") && trimmed.includes("}}")) return "";
   const lower = trimmed.toLowerCase();
   if (lower === "null" || lower === "undefined") return "";
@@ -139,16 +140,32 @@ function isTelnyxCallControlId(value) {
   return t.startsWith("v3:");
 }
 
+/** Telnyx sometimes leaves `{{call_id}}` in tool args — never treat as a phone. */
+function isUnresolvedTemplate(value) {
+  return typeof value === "string" && value.includes("{{") && value.includes("}}");
+}
+
+/** Stable key so duplicate search_recipes calls merge (same ingredients, any order). */
+function searchRecipesIngredientKey(ingredients) {
+  const list = (Array.isArray(ingredients) ? ingredients : [])
+    .map((s) => String(s).trim().toLowerCase())
+    .filter(Boolean)
+    .sort();
+  return JSON.stringify(list);
+}
+
 /** Merge tool args when the LLM puts call_id in the `phone` field by mistake. */
 function mergePhoneAndCallId(phoneRaw, callIdRaw) {
   let call_id = normalizeCallId(callIdRaw);
   let phone = "";
 
-  if (isTelnyxCallControlId(phoneRaw)) {
-    const id = phoneRaw.trim();
+  const pr = isUnresolvedTemplate(phoneRaw) ? "" : phoneRaw;
+
+  if (isTelnyxCallControlId(pr)) {
+    const id = pr.trim();
     if (!call_id) call_id = id;
   } else {
-    phone = normalizePhone(phoneRaw);
+    phone = normalizePhone(pr);
   }
   return { phone, call_id };
 }
@@ -284,15 +301,10 @@ app.post("/webhook", (req, res) => {
 
   console.log(`[webhook] 📞 call from ${callerPhone || "(unknown)"} — ${isReturning ? "returning caller" : "new caller"}`);
 
-  const opening_line = isReturning
-    ? `Hey, welcome back! Last time you made ${user?.lastMeal || "something tasty"}. What are you working with tonight?`
-    : "Hey! I'm Fridge Friend — I help you figure out what to cook with whatever's in your fridge. Any dietary restrictions I should know about?";
-
   res.json({
     caller_phone: callerPhone,
     call_id: callId,
     greeting_type: isReturning ? "returning" : "new",
-    opening_line,
     last_meal: user?.lastMeal || "nothing yet",
     call_count: user?.callCount || 0,
     dietary_restrictions: preferences.dietary || "none",
@@ -423,7 +435,8 @@ async function handleSavePreference({ phone, call_id, meal_name, liked, dietary,
 app.post("/tools/get_user_history", async (req, res) => {
   try {
     const extracted = extractPhoneFromRequest(req);
-    let call_id = req.body?.call_id || req.body?.conversation_id || extractCallIdFromRequest(req);
+    let call_id =
+      extractCallIdFromRequest(req) || normalizeCallId(req.body?.call_id) || normalizeCallId(req.body?.conversation_id);
     const merged = mergePhoneAndCallId(req.body?.phone, call_id);
     call_id = merged.call_id || call_id;
     const phoneFromBody = merged.phone;
@@ -441,13 +454,17 @@ app.post("/tools/search_recipes", async (req, res) => {
   try {
     const params = req.body?.parameters || req.body?.input || req.body || {};
     const extracted = extractPhoneFromRequest(req);
-    let call_id = params?.call_id || params?.conversation_id || extractCallIdFromRequest(req);
+    let call_id =
+      extractCallIdFromRequest(req) ||
+      normalizeCallId(params?.call_id) ||
+      normalizeCallId(params?.conversation_id);
     const merged = mergePhoneAndCallId(params?.phone, call_id);
     call_id = merged.call_id || call_id;
     const phoneFromBody = merged.phone;
     const phoneFromCallCtx = call_id ? callContextStore[call_id]?.phone : "";
     const phone = phoneFromBody || extracted || phoneFromCallCtx || "";
-    const dedupePayload = { call_id: call_id || "", phone: phone || "", ingredients: params.ingredients || [] };
+    const ingKey = searchRecipesIngredientKey(params.ingredients);
+    const dedupePayload = { ingredientsKey: ingKey };
     const cached = getRecentToolResult("search_recipes", dedupePayload);
     if (cached) return res.json(cached);
     const { key, promise } = getInFlightToolPromise("search_recipes", dedupePayload);
@@ -500,7 +517,8 @@ app.post("/tools/get_recipe_details", async (req, res) => {
 app.post("/tools/save_preference", async (req, res) => {
   try {
     const extracted = extractPhoneFromRequest(req);
-    let call_id = req.body?.call_id || req.body?.conversation_id || extractCallIdFromRequest(req);
+    let call_id =
+      extractCallIdFromRequest(req) || normalizeCallId(req.body?.call_id) || normalizeCallId(req.body?.conversation_id);
     const merged = mergePhoneAndCallId(req.body?.phone, call_id);
     call_id = merged.call_id || call_id;
     const phoneFromBody = merged.phone;
