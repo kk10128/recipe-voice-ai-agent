@@ -49,8 +49,6 @@ const CALL_CONTEXT_SWEEP_MS = 5 * 60 * 1000;
 const recentToolResults = {};
 const inFlightToolResults = {};
 const TOOL_DEDUPE_WINDOW_MS = 8000;
-const recentMcpRequests = new Map();
-const MCP_DEDUPE_WINDOW_MS = 3000;
 
 function coerceBoolean(value) {
   if (typeof value === "boolean") return value;
@@ -132,9 +130,43 @@ function extractCallIdFromRequest(req) {
   return "";
 }
 
+function isTelnyxCallControlId(value) {
+  if (typeof value !== "string") return false;
+  const t = value.trim();
+  if (!t) return false;
+  if (t.includes("{{") && t.includes("}}")) return false;
+  // Telnyx AI Assistant call_control_id shape seen in production
+  return t.startsWith("v3:");
+}
+
+/** Merge tool args when the LLM puts call_id in the `phone` field by mistake. */
+function mergePhoneAndCallId(phoneRaw, callIdRaw) {
+  let call_id = normalizeCallId(callIdRaw);
+  let phone = "";
+
+  if (isTelnyxCallControlId(phoneRaw)) {
+    const id = phoneRaw.trim();
+    if (!call_id) call_id = id;
+  } else {
+    phone = normalizePhone(phoneRaw);
+  }
+  return { phone, call_id };
+}
+
 function resolvePhone({ phone, call_id }) {
+  if (isTelnyxCallControlId(phone)) {
+    const id = phone.trim();
+    const ctx = callContextStore[id];
+    if (ctx?.phone) {
+      ctx.updatedAtMs = Date.now();
+      return ctx.phone;
+    }
+    return "";
+  }
+
   const normalizedPhone = normalizePhone(phone);
   if (normalizedPhone) return normalizedPhone;
+
   const normalizedCallId = normalizeCallId(call_id);
   if (normalizedCallId) {
     const ctx = callContextStore[normalizedCallId];
@@ -391,8 +423,10 @@ async function handleSavePreference({ phone, call_id, meal_name, liked, dietary,
 app.post("/tools/get_user_history", async (req, res) => {
   try {
     const extracted = extractPhoneFromRequest(req);
-    const call_id = req.body?.call_id || req.body?.conversation_id || extractCallIdFromRequest(req);
-    const phoneFromBody = normalizePhone(req.body?.phone);
+    let call_id = req.body?.call_id || req.body?.conversation_id || extractCallIdFromRequest(req);
+    const merged = mergePhoneAndCallId(req.body?.phone, call_id);
+    call_id = merged.call_id || call_id;
+    const phoneFromBody = merged.phone;
     const phoneFromCallCtx = call_id ? callContextStore[call_id]?.phone : "";
     const phone = phoneFromBody || extracted || phoneFromCallCtx || "";
     const result = await handleGetUserHistory({ phone, call_id });
@@ -407,8 +441,10 @@ app.post("/tools/search_recipes", async (req, res) => {
   try {
     const params = req.body?.parameters || req.body?.input || req.body || {};
     const extracted = extractPhoneFromRequest(req);
-    const call_id = params?.call_id || params?.conversation_id || extractCallIdFromRequest(req);
-    const phoneFromBody = normalizePhone(params?.phone);
+    let call_id = params?.call_id || params?.conversation_id || extractCallIdFromRequest(req);
+    const merged = mergePhoneAndCallId(params?.phone, call_id);
+    call_id = merged.call_id || call_id;
+    const phoneFromBody = merged.phone;
     const phoneFromCallCtx = call_id ? callContextStore[call_id]?.phone : "";
     const phone = phoneFromBody || extracted || phoneFromCallCtx || "";
     const dedupePayload = { call_id: call_id || "", phone: phone || "", ingredients: params.ingredients || [] };
@@ -464,8 +500,10 @@ app.post("/tools/get_recipe_details", async (req, res) => {
 app.post("/tools/save_preference", async (req, res) => {
   try {
     const extracted = extractPhoneFromRequest(req);
-    const call_id = req.body?.call_id || req.body?.conversation_id || extractCallIdFromRequest(req);
-    const phoneFromBody = normalizePhone(req.body?.phone);
+    let call_id = req.body?.call_id || req.body?.conversation_id || extractCallIdFromRequest(req);
+    const merged = mergePhoneAndCallId(req.body?.phone, call_id);
+    call_id = merged.call_id || call_id;
+    const phoneFromBody = merged.phone;
     const phoneFromCallCtx = call_id ? callContextStore[call_id]?.phone : "";
     const phone = phoneFromBody || extracted || phoneFromCallCtx || "";
     const result = await handleSavePreference({ ...req.body, phone, call_id });
@@ -492,9 +530,20 @@ function getMcpServer() {
       callerPhone: z.string().optional().describe("Caller phone number (alt field)"),
     },
     async ({ phone, call_id, from, caller_id, caller_phone, callerPhone }) => {
-      const normalized = normalizePhone(phone) || normalizePhone(from) || normalizePhone(caller_id) || normalizePhone(caller_phone) || normalizePhone(callerPhone);
+      let m = mergePhoneAndCallId(phone, call_id);
+      m = mergePhoneAndCallId(from, m.call_id);
+      const normalized =
+        m.phone ||
+        normalizePhone(caller_id) ||
+        normalizePhone(caller_phone) ||
+        normalizePhone(callerPhone);
       return {
-        content: [{ type: "text", text: JSON.stringify(await handleGetUserHistory({ phone: normalized, call_id }), null, 2) }],
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(await handleGetUserHistory({ phone: normalized, call_id: m.call_id }), null, 2),
+          },
+        ],
       };
     }
   );
@@ -507,9 +556,15 @@ function getMcpServer() {
       from: z.string().optional().describe("Caller phone number (alt field)"),
     },
     async ({ ingredients, phone, call_id, from }) => {
-      const normalized = normalizePhone(phone) || normalizePhone(from);
+      let m = mergePhoneAndCallId(phone, call_id);
+      m = mergePhoneAndCallId(from, m.call_id);
       return {
-        content: [{ type: "text", text: JSON.stringify(await handleSearchRecipes({ ingredients, phone: normalized, call_id }), null, 2) }],
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(await handleSearchRecipes({ ingredients, phone: m.phone, call_id: m.call_id }), null, 2),
+          },
+        ],
       };
     }
   );
@@ -533,9 +588,27 @@ function getMcpServer() {
       high_protein: z.boolean().optional().describe("Wants high protein"),
     },
     async ({ phone, call_id, from, meal_name, liked, dietary, low_carb, high_protein }) => {
-      const normalized = normalizePhone(phone) || normalizePhone(from);
+      let m = mergePhoneAndCallId(phone, call_id);
+      m = mergePhoneAndCallId(from, m.call_id);
       return {
-        content: [{ type: "text", text: JSON.stringify(await handleSavePreference({ phone: normalized, call_id, meal_name, liked, dietary, low_carb, high_protein }), null, 2) }],
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              await handleSavePreference({
+                phone: m.phone,
+                call_id: m.call_id,
+                meal_name,
+                liked,
+                dietary,
+                low_carb,
+                high_protein,
+              }),
+              null,
+              2
+            ),
+          },
+        ],
       };
     }
   );
@@ -557,25 +630,6 @@ app.get("/mcp", (req, res) => {
 
 // MCP tool calls (POST)
 app.post("/mcp", async (req, res) => {
-  const method = req.body?.method || "";
-  const toolName = req.body?.params?.name || "";
-  const toolArgs = req.body?.params?.arguments || {};
-  const dedupeKey = `${method}:${toolName}:${JSON.stringify(toolArgs)}`;
-  const now = Date.now();
-
-  const lastSeen = recentMcpRequests.get(dedupeKey);
-  if (lastSeen && now - lastSeen < MCP_DEDUPE_WINDOW_MS) {
-    return res.json({
-      jsonrpc: "2.0",
-      result: { content: [{ type: "text", text: "{\"dedup\":true}" }] },
-      id: req.body?.id ?? null,
-    });
-  }
-  recentMcpRequests.set(dedupeKey, now);
-  for (const [key, ts] of recentMcpRequests.entries()) {
-    if (now - ts > 10000) recentMcpRequests.delete(key);
-  }
-
   const server = getMcpServer();
   const transport = new StreamableHTTPServerTransport({
     sessionIdGenerator: undefined,
