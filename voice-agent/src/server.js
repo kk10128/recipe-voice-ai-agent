@@ -5,6 +5,9 @@ const { McpServer } = require("@modelcontextprotocol/sdk/server/mcp.js");
 const { StreamableHTTPServerTransport } = require("@modelcontextprotocol/sdk/server/streamableHttp.js");
 const { z } = require("zod");
 
+// In-memory user store backed by a JSON file.
+// Maps phone -> { callCount, lastMeal, preferences, likedMeals }
+// On Railway free tier this resets on restart — swap for Postgres in production.
 const LOCAL_USER_STORE_PATH = path.join(__dirname, "../../users.json");
 const DEFAULT_USER_STORE_PATH = "/data/users.json";
 const USER_STORE_PATH =
@@ -16,6 +19,7 @@ function loadUserStore() {
   try {
     if (fs.existsSync(USER_STORE_PATH)) {
       const data = JSON.parse(fs.readFileSync(USER_STORE_PATH, "utf8"));
+      // Re-key all phones to consistent +digits format on load
       for (const [rawKey, value] of Object.entries(data)) {
         const keyStr = String(rawKey);
         if (keyStr.includes("{{") && keyStr.includes("}}")) continue;
@@ -43,9 +47,17 @@ function saveUserStore() {
 
 loadUserStore();
 
+// Maps call_id -> phone, populated at webhook time.
+// Fallback so tool calls can resolve phone even when it's missing from the request.
+// Entries expire after 30 min and are swept every 5 min.
 const callContextStore = {};
 const CALL_CONTEXT_TTL_MS = 30 * 60 * 1000;
 const CALL_CONTEXT_SWEEP_MS = 5 * 60 * 1000;
+
+// Dedup stores — Telnyx fires every tool call twice (MCP + REST paths simultaneously).
+// recentToolResults: caches results for 8s, returns cache on the duplicate call.
+// inFlightToolResults: coalesces parallel requests into one shared promise.
+// recentSavePreferences: prevents duplicate writes to the user store.
 const recentToolResults = {};
 const inFlightToolResults = {};
 const TOOL_DEDUPE_WINDOW_MS = 8000;
@@ -53,9 +65,7 @@ const SAVE_PREF_DEDUPE_MS = 15000;
 const recentSavePreferences = {};
 const inFlightSavePreferences = {};
 
-// ============================================================
-// DUPLICATE RESPONSE DEDUP (fixes double-fire from Telnyx)
-// ============================================================
+// sentResponses: blocks duplicate search requests within 15s at the endpoint level
 const sentResponses = {};
 const SENT_DEDUPE_MS = 15000;
 
@@ -68,7 +78,7 @@ function isDuplicateSearchRequest(ingredientsKey) {
   return false;
 }
 
-// Sweep old sent response keys every minute
+// Clean up stale dedup keys every minute
 setInterval(() => {
   const now = Date.now();
   for (const key of Object.keys(sentResponses)) {
@@ -92,6 +102,9 @@ function coerceBoolean(value) {
 const app = express();
 app.use(express.json());
 
+// Normalizes any phone value to +digits format.
+// Handles: missing country codes, unresolved Telnyx templates like {{caller_phone}},
+// "null" strings, and inconsistent formatting.
 function normalizePhone(value) {
   if (value === null || value === undefined) return "";
   if (typeof value !== "string") return "";
@@ -105,6 +118,8 @@ function normalizePhone(value) {
   return `+${digits}`;
 }
 
+// Checks 15+ candidate fields because Telnyx sends phone in different
+// locations depending on the call type and event shape.
 function extractPhoneFromRequest(req) {
   const body = req?.body || {};
   const headers = req?.headers || {};
@@ -158,6 +173,8 @@ function extractCallIdFromRequest(req) {
   return "";
 }
 
+// Telnyx call control IDs always start with "v3:".
+// Used to detect when the assistant accidentally passes a call_id where phone is expected.
 function isTelnyxCallControlId(value) {
   if (typeof value !== "string") return false;
   const t = value.trim();
@@ -178,6 +195,8 @@ function searchRecipesIngredientKey(ingredients) {
   return JSON.stringify(list);
 }
 
+// Separates phone and call_id from a raw input that might contain either.
+// Handles the case where the assistant passes a v3: call_id in the phone field.
 function mergePhoneAndCallId(phoneRaw, callIdRaw) {
   let call_id = normalizeCallId(callIdRaw);
   let phone = "";
@@ -193,6 +212,11 @@ function mergePhoneAndCallId(phoneRaw, callIdRaw) {
   return { phone, call_id };
 }
 
+// Two-layer phone resolution:
+// Layer 1 — use phone field directly if it's a real number.
+// Layer 2 — look up call_id in callContextStore.
+//           The webhook always stores call_id -> phone at call start,
+//           so even if phone is missing from a tool call later we can find it.
 function resolvePhone({ phone, call_id }) {
   if (isTelnyxCallControlId(phone)) {
     const id = phone.trim();
@@ -218,6 +242,7 @@ function resolvePhone({ phone, call_id }) {
   return "";
 }
 
+// Removes call context entries older than TTL to prevent unbounded memory growth
 function pruneCallContextStore() {
   const now = Date.now();
   let removed = 0;
@@ -263,6 +288,9 @@ function clearInFlightToolPromise(key) {
   delete inFlightToolResults[key];
 }
 
+// All Spoonacular API calls go through this.
+// AbortController gives a 12s hard timeout — if the API hangs the call fails fast
+// and the assistant falls back to suggesting a meal itself.
 async function fetchJsonWithTimeout(url, { timeoutMs = 12000, ...options } = {}) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
@@ -292,9 +320,10 @@ app.get("/", (req, res) => {
   res.json({ status: "fridge-to-meal is running" });
 });
 
-// ============================================================
-// DYNAMIC WEBHOOK VARIABLES
-// ============================================================
+// Telnyx calls this endpoint before every conversation starts.
+// Returns variables injected directly into the assistant's system prompt.
+// The assistant knows caller context (new vs returning, last meal, dietary prefs)
+// before saying a single word. Also stores call_id -> phone for tool fallback.
 app.post("/webhook", (req, res) => {
   let callerPhone = extractPhoneFromRequest(req);
   const callId = extractCallIdFromRequest(req);
@@ -316,6 +345,7 @@ app.post("/webhook", (req, res) => {
 
   const user = callerPhone ? userStore[callerPhone] : undefined;
 
+  // Store call_id -> phone so tools can look up phone by call_id later
   if (callerPhone && callId) {
     callContextStore[callId] = { phone: callerPhone, updatedAtMs: Date.now() };
   }
@@ -324,6 +354,7 @@ app.post("/webhook", (req, res) => {
 
   console.log(`[webhook] 📞 call from ${callerPhone || "(unknown)"} — ${isReturning ? "returning caller" : "new caller"}`);
 
+  // All keys below become {{variable}} in the Telnyx assistant system prompt
   res.json({
     caller_phone: callerPhone,
     call_id: callId,
@@ -337,9 +368,10 @@ app.post("/webhook", (req, res) => {
   });
 });
 
-// ============================================================
-// TOOL HANDLERS
-// ============================================================
+// These handler functions are shared between the REST endpoints and the MCP server.
+// Key architecture decision: one source of truth — fix a bug here, it's fixed in both paths.
+
+// Returns caller's full history and preferences for personalization
 async function handleGetUserHistory({ phone, call_id }) {
   const target = resolvePhone({ phone, call_id });
   console.log(`[get_user_history] 👤 looking up ${target || phone || call_id}`);
@@ -347,6 +379,9 @@ async function handleGetUserHistory({ phone, call_id }) {
   return user || { callCount: 0, lastMeal: "nothing yet", preferences: {}, likedMeals: [] };
 }
 
+// Searches Spoonacular with the caller's ingredients.
+// Auto-applies dietary filters from the caller's saved profile.
+// Prefers exact matches (missedCount 0), falls back to closest if none found.
 async function handleSearchRecipes({ ingredients, phone, call_id }) {
   console.log(`[search_recipes] 🔍 ingredients: ${ingredients}`);
   const target = resolvePhone({ phone, call_id });
@@ -372,6 +407,7 @@ async function handleSearchRecipes({ ingredients, phone, call_id }) {
     recipes = await fetchJsonWithTimeout(url);
   } catch (err) {
     console.error(`[search_recipes] ❌ failed: ${err.message}`);
+    // Structured error — assistant sees this and suggests a meal itself as fallback
     return { error: "spoonacular_search_failed", message: err.message };
   }
 
@@ -392,6 +428,7 @@ async function handleSearchRecipes({ ingredients, phone, call_id }) {
   }));
 }
 
+// Fetches full instructions and nutrition info for a recipe the caller picked
 async function handleGetRecipeDetails({ recipe_id }) {
   console.log(`[get_recipe_details] 📖 fetching recipe ${recipe_id}`);
   const apiKey = process.env.SPOONACULAR_API_KEY;
@@ -429,6 +466,8 @@ async function handleGetRecipeDetails({ recipe_id }) {
   };
 }
 
+// Saves the caller's meal choice and dietary preferences.
+// Includes dedup logic to prevent double-writes from Telnyx's double-fire behavior.
 async function handleSavePreference({ phone, call_id, meal_name, liked, dietary, low_carb, high_protein }) {
   const target = resolvePhone({ phone, call_id });
   if (!target) {
@@ -437,6 +476,7 @@ async function handleSavePreference({ phone, call_id, meal_name, liked, dietary,
 
   const likedBool = coerceBoolean(liked);
 
+  // Same caller + same meal + same prefs within 15s = skip duplicate write
   const prefKey = [
     target,
     String(meal_name || "").trim().toLowerCase(),
@@ -483,9 +523,9 @@ async function handleSavePreference({ phone, call_id, meal_name, liked, dietary,
   }
 }
 
-// ============================================================
-// DIRECT TOOL ENDPOINTS
-// ============================================================
+// Direct REST endpoints — Telnyx calls these mid-conversation when tools are triggered.
+// Each one resolves the phone then delegates to the shared handler above.
+
 app.post("/tools/get_user_history", async (req, res) => {
   try {
     const extracted = extractPhoneFromRequest(req);
@@ -520,7 +560,7 @@ app.post("/tools/search_recipes", async (req, res) => {
 
     const ingKey = searchRecipesIngredientKey(params.ingredients);
 
-    // Block duplicate requests from Telnyx double-firing
+    // Block the duplicate — Telnyx fires this endpoint twice per tool call
     if (isDuplicateSearchRequest(ingKey)) {
       // console.log(`[search_recipes] 🚫 duplicate request blocked for ingredients: ${ingKey}`);
       return res.status(429).json({ error: "duplicate_request", message: "This search was already processed." });
@@ -594,9 +634,10 @@ app.post("/tools/save_preference", async (req, res) => {
   }
 });
 
-// ============================================================
-// MCP SERVER
-// ============================================================
+// MCP server — registers the same 4 tools in MCP protocol format.
+// Calls the exact same shared handlers as the REST endpoints above.
+// GET  /mcp -> tool manifest (open this in browser during the demo)
+// POST /mcp -> handles MCP-formatted tool calls from Telnyx
 function getMcpServer() {
   const server = new McpServer({ name: "fridge-to-meal", version: "1.0.0" });
 
@@ -704,7 +745,7 @@ function getMcpServer() {
   return server;
 }
 
-// MCP tool discovery (GET)
+// Tool manifest — open this in the browser during the demo walkthrough
 app.get("/mcp", (req, res) => {
   res.json({
     tools: [
@@ -716,7 +757,7 @@ app.get("/mcp", (req, res) => {
   });
 });
 
-// MCP tool calls (POST)
+// Handles MCP-formatted tool calls from the Telnyx assistant
 app.post("/mcp", async (req, res) => {
   const server = getMcpServer();
   const transport = new StreamableHTTPServerTransport({
@@ -739,7 +780,7 @@ app.post("/mcp", async (req, res) => {
   }
 });
 
-// Keep-alive ping
+// Pings our own health endpoint every 4 min to prevent Railway from sleeping the container
 setInterval(async () => {
   try {
     await fetch(`https://recipe-voice-ai-agent-production.up.railway.app/`);
@@ -749,7 +790,7 @@ setInterval(async () => {
   }
 }, 4 * 60 * 1000);
 
-// Prune stale call context
+// Removes stale call context entries every 5 min
 setInterval(pruneCallContextStore, CALL_CONTEXT_SWEEP_MS);
 
 const PORT = Number(process.env.PORT) || 3000;
