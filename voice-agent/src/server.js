@@ -52,6 +52,12 @@ const TOOL_DEDUPE_WINDOW_MS = 8000;
 const SAVE_PREF_DEDUPE_MS = 15000;
 const recentSavePreferences = {};
 const inFlightSavePreferences = {};
+const MAX_INGREDIENTS = 12;
+const MAX_INGREDIENT_LEN = 40;
+const MAX_MEAL_NAME_LEN = 120;
+const SEARCH_DEDUPE_MS = 8000;
+const recentSearchResults = {};
+const inFlightSearchResults = {};
 
 // ============================================================
 // DUPLICATE RESPONSE DEDUP (fixes double-fire from Telnyx)
@@ -66,6 +72,16 @@ function isDuplicateSearchRequest(ingredientsKey) {
   }
   sentResponses[ingredientsKey] = now;
   return false;
+}
+
+function sanitizeIngredientList(ingredients) {
+  const list = Array.isArray(ingredients) ? ingredients : [];
+  return list
+    .map((s) => (s === null || s === undefined ? "" : String(s)))
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .slice(0, MAX_INGREDIENTS)
+    .map((s) => s.slice(0, MAX_INGREDIENT_LEN));
 }
 
 // Sweep old sent response keys every minute
@@ -263,6 +279,20 @@ function clearInFlightToolPromise(key) {
   delete inFlightToolResults[key];
 }
 
+function pruneRecentSavePreferences() {
+  const now = Date.now();
+  for (const [k, ts] of Object.entries(recentSavePreferences)) {
+    if (now - ts > SAVE_PREF_DEDUPE_MS) delete recentSavePreferences[k];
+  }
+}
+
+function pruneRecentSearchResults() {
+  const now = Date.now();
+  for (const [k, entry] of Object.entries(recentSearchResults)) {
+    if (!entry?.atMs || now - entry.atMs > SEARCH_DEDUPE_MS) delete recentSearchResults[k];
+  }
+}
+
 async function fetchJsonWithTimeout(url, { timeoutMs = 12000, ...options } = {}) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
@@ -348,48 +378,73 @@ async function handleGetUserHistory({ phone, call_id }) {
 }
 
 async function handleSearchRecipes({ ingredients, phone, call_id }) {
-  console.log(`[search_recipes] 🔍 ingredients: ${ingredients}`);
+  const safeIngredients = sanitizeIngredientList(ingredients);
+  console.log(`[search_recipes] 🔍 ingredients: ${safeIngredients}`);
+  if (!safeIngredients.length) return { error: "No ingredients provided" };
+
   const target = resolvePhone({ phone, call_id });
   const user = target ? userStore[target] : null;
   const dietary = user?.preferences?.dietary || "";
   const lowCarb = user?.preferences?.wantLowCarb || false;
 
-  let dietParam = "";
-  if (dietary === "vegetarian") dietParam = "&diet=vegetarian";
-  else if (dietary === "vegan") dietParam = "&diet=vegan";
-  else if (dietary === "gluten-free") dietParam = "&diet=gluten+free";
-  else if (lowCarb) dietParam = "&diet=low-carb";
+  const ingKey = searchRecipesIngredientKey(safeIngredients);
+  const searchKey = `${ingKey}|${target || ""}|${dietary}|${lowCarb ? 1 : 0}`;
+  const now = Date.now();
 
-  const apiKey = process.env.SPOONACULAR_API_KEY;
-  if (!apiKey) return { error: "missing_spoonacular_api_key" };
+  const cached = recentSearchResults[searchKey];
+  if (cached && now - cached.atMs < SEARCH_DEDUPE_MS) return cached.result;
 
-  const url = `https://api.spoonacular.com/recipes/findByIngredients?ingredients=${encodeURIComponent(
-    ingredients.join(",")
-  )}&number=5&ranking=2&ignorePantry=true${dietParam}&apiKey=${apiKey}`;
-
-  let recipes;
-  try {
-    recipes = await fetchJsonWithTimeout(url);
-  } catch (err) {
-    console.error(`[search_recipes] ❌ failed: ${err.message}`);
-    return { error: "spoonacular_search_failed", message: err.message };
+  if (inFlightSearchResults[searchKey]) {
+    return await inFlightSearchResults[searchKey];
   }
 
-  if (!recipes || recipes.length === 0) return { error: "No recipes found" };
+  const run = (async () => {
+    let dietParam = "";
+    if (dietary === "vegetarian") dietParam = "&diet=vegetarian";
+    else if (dietary === "vegan") dietParam = "&diet=vegan";
+    else if (dietary === "gluten-free") dietParam = "&diet=gluten+free";
+    else if (lowCarb) dietParam = "&diet=low-carb";
 
-  const filtered = recipes.filter((r) => r.missedIngredientCount === 0);
-  const finalRecipes = (filtered.length > 0 ? filtered : recipes).slice(0, 3);
+    const apiKey = process.env.SPOONACULAR_API_KEY;
+    if (!apiKey) return { error: "missing_spoonacular_api_key" };
 
-  console.log(`[search_recipes] ✅ found ${finalRecipes.length} result(s)`);
+    const url = `https://api.spoonacular.com/recipes/findByIngredients?ingredients=${encodeURIComponent(
+      safeIngredients.join(",")
+    )}&number=5&ranking=2&ignorePantry=true${dietParam}&apiKey=${apiKey}`;
 
-  return finalRecipes.map((r, i) => ({
-    number: i + 1,
-    id: r.id,
-    name: r.title,
-    usedIngredients: r.usedIngredients?.map((i) => i.name).join(", "),
-    missedIngredients: r.missedIngredients?.map((i) => i.name).join(", ") || "none",
-    missedCount: r.missedIngredientCount,
-  }));
+    let recipes;
+    try {
+      recipes = await fetchJsonWithTimeout(url);
+    } catch (err) {
+      console.error(`[search_recipes] ❌ failed: ${err.message}`);
+      return { error: "spoonacular_search_failed", message: err.message };
+    }
+
+    if (!recipes || recipes.length === 0) return { error: "No recipes found" };
+
+    const filtered = recipes.filter((r) => r.missedIngredientCount === 0);
+    const finalRecipes = (filtered.length > 0 ? filtered : recipes).slice(0, 3);
+
+    console.log(`[search_recipes] ✅ found ${finalRecipes.length} result(s)`);
+
+    return finalRecipes.map((r, i) => ({
+      number: i + 1,
+      id: r.id,
+      name: r.title,
+      usedIngredients: r.usedIngredients?.map((i) => i.name).join(", "),
+      missedIngredients: r.missedIngredients?.map((i) => i.name).join(", ") || "none",
+      missedCount: r.missedIngredientCount,
+    }));
+  })();
+
+  inFlightSearchResults[searchKey] = run;
+  try {
+    const result = await run;
+    recentSearchResults[searchKey] = { atMs: Date.now(), result };
+    return result;
+  } finally {
+    delete inFlightSearchResults[searchKey];
+  }
 }
 
 async function handleGetRecipeDetails({ recipe_id }) {
@@ -518,13 +573,8 @@ app.post("/tools/search_recipes", async (req, res) => {
     const phoneFromCallCtx = call_id ? callContextStore[call_id]?.phone : "";
     const phone = phoneFromBody || extracted || phoneFromCallCtx || "";
 
-    const ingKey = searchRecipesIngredientKey(params.ingredients);
-
-    // Block duplicate requests from Telnyx double-firing
-    if (isDuplicateSearchRequest(ingKey)) {
-      // console.log(`[search_recipes] 🚫 duplicate request blocked for ingredients: ${ingKey}`);
-      return res.status(429).json({ error: "duplicate_request", message: "This search was already processed." });
-    }
+    const ingList = sanitizeIngredientList(params.ingredients);
+    const ingKey = searchRecipesIngredientKey(ingList);
 
     const dedupePayload = { ingredientsKey: ingKey };
     const cached = getRecentToolResult("search_recipes", dedupePayload);
@@ -639,13 +689,6 @@ function getMcpServer() {
       let m = mergePhoneAndCallId(phone, call_id);
       m = mergePhoneAndCallId(from, m.call_id);
 
-      const ingKey = searchRecipesIngredientKey(ingredients);
-      if (isDuplicateSearchRequest(ingKey)) {
-        return {
-          content: [{ type: "text", text: JSON.stringify({ error: "duplicate_request" }, null, 2) }],
-        };
-      }
-
       return {
         content: [
           {
@@ -751,6 +794,10 @@ setInterval(async () => {
 
 // Prune stale call context
 setInterval(pruneCallContextStore, CALL_CONTEXT_SWEEP_MS);
+
+// Prevent unbounded growth in dedupe caches.
+setInterval(pruneRecentSavePreferences, 60 * 1000);
+setInterval(pruneRecentSearchResults, 60 * 1000);
 
 const PORT = Number(process.env.PORT) || 3000;
 app.listen(PORT, () => console.log(`fridge-to-meal server listening on port ${PORT}`));
