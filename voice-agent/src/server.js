@@ -612,13 +612,8 @@ app.post("/mcp", async (req, res) => {
 
 // Keep-alive ping — prevents Railway from sleeping
 setInterval(async () => {
-  try {
-    await fetch(`http://localhost:${PORT}/`);
-    console.log("[keep-alive] ping");
-  } catch (err) {
-    console.error("[keep-alive] failed:", err.message);
-  }
-}, 5 * 60 * 1000);
+  await fetch(`https://recipe-voice-ai-agent-production.up.railway.app/`);
+}, 4 * 60 * 1000);
 
 // Prevent unbounded growth of per-call context in long-running servers.
 setInterval(pruneCallContextStore, CALL_CONTEXT_SWEEP_MS);
