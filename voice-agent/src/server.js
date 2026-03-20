@@ -488,7 +488,7 @@ app.post("/tools/search_recipes", async (req, res) => {
 
     // Block duplicate requests from Telnyx double-firing
     if (isDuplicateSearchRequest(ingKey)) {
-      console.log(`[search_recipes] 🚫 duplicate request blocked for ingredients: ${ingKey}`);
+      // console.log(`[search_recipes] 🚫 duplicate request blocked for ingredients: ${ingKey}`);
       return res.status(429).json({ error: "duplicate_request", message: "This search was already processed." });
     }
 
