@@ -50,6 +50,31 @@ const recentToolResults = {};
 const inFlightToolResults = {};
 const TOOL_DEDUPE_WINDOW_MS = 8000;
 
+// ============================================================
+// DUPLICATE RESPONSE DEDUP (fixes double-fire from Telnyx)
+// ============================================================
+const sentResponses = {};
+const SENT_DEDUPE_MS = 15000;
+
+function isDuplicateSearchRequest(ingredientsKey) {
+  const now = Date.now();
+  if (sentResponses[ingredientsKey] && now - sentResponses[ingredientsKey] < SENT_DEDUPE_MS) {
+    return true;
+  }
+  sentResponses[ingredientsKey] = now;
+  return false;
+}
+
+// Sweep old sent response keys every minute
+setInterval(() => {
+  const now = Date.now();
+  for (const key of Object.keys(sentResponses)) {
+    if (now - sentResponses[key] > SENT_DEDUPE_MS) {
+      delete sentResponses[key];
+    }
+  }
+}, 60 * 1000);
+
 function coerceBoolean(value) {
   if (typeof value === "boolean") return value;
   if (value === null || value === undefined) return false;
@@ -69,7 +94,6 @@ function normalizePhone(value) {
   if (typeof value !== "string") return "";
   const trimmed = value.trim();
   if (!trimmed) return "";
-  // Unsubstituted Telnyx template — not a real number
   if (trimmed.includes("{{") && trimmed.includes("}}")) return "";
   const lower = trimmed.toLowerCase();
   if (lower === "null" || lower === "undefined") return "";
@@ -136,16 +160,13 @@ function isTelnyxCallControlId(value) {
   const t = value.trim();
   if (!t) return false;
   if (t.includes("{{") && t.includes("}}")) return false;
-  // Telnyx AI Assistant call_control_id shape seen in production
   return t.startsWith("v3:");
 }
 
-/** Telnyx sometimes leaves `{{call_id}}` in tool args — never treat as a phone. */
 function isUnresolvedTemplate(value) {
   return typeof value === "string" && value.includes("{{") && value.includes("}}");
 }
 
-/** Stable key so duplicate search_recipes calls merge (same ingredients, any order). */
 function searchRecipesIngredientKey(ingredients) {
   const list = (Array.isArray(ingredients) ? ingredients : [])
     .map((s) => String(s).trim().toLowerCase())
@@ -154,7 +175,6 @@ function searchRecipesIngredientKey(ingredients) {
   return JSON.stringify(list);
 }
 
-/** Merge tool args when the LLM puts call_id in the `phone` field by mistake. */
 function mergePhoneAndCallId(phoneRaw, callIdRaw) {
   let call_id = normalizeCallId(callIdRaw);
   let phone = "";
@@ -463,7 +483,15 @@ app.post("/tools/search_recipes", async (req, res) => {
     const phoneFromBody = merged.phone;
     const phoneFromCallCtx = call_id ? callContextStore[call_id]?.phone : "";
     const phone = phoneFromBody || extracted || phoneFromCallCtx || "";
+
     const ingKey = searchRecipesIngredientKey(params.ingredients);
+
+    // Block duplicate requests from Telnyx double-firing
+    if (isDuplicateSearchRequest(ingKey)) {
+      console.log(`[search_recipes] 🚫 duplicate request blocked for ingredients: ${ingKey}`);
+      return res.status(429).json({ error: "duplicate_request", message: "This search was already processed." });
+    }
+
     const dedupePayload = { ingredientsKey: ingKey };
     const cached = getRecentToolResult("search_recipes", dedupePayload);
     if (cached) return res.json(cached);
@@ -576,6 +604,15 @@ function getMcpServer() {
     async ({ ingredients, phone, call_id, from }) => {
       let m = mergePhoneAndCallId(phone, call_id);
       m = mergePhoneAndCallId(from, m.call_id);
+
+      const ingKey = searchRecipesIngredientKey(ingredients);
+      if (isDuplicateSearchRequest(ingKey)) {
+        console.log(`[mcp/search_recipes] 🚫 duplicate blocked for: ${ingKey}`);
+        return {
+          content: [{ type: "text", text: JSON.stringify({ error: "duplicate_request" }, null, 2) }],
+        };
+      }
+
       return {
         content: [
           {
