@@ -46,6 +46,9 @@ loadUserStore();
 const callContextStore = {};
 const CALL_CONTEXT_TTL_MS = 30 * 60 * 1000;
 const CALL_CONTEXT_SWEEP_MS = 5 * 60 * 1000;
+const recentToolResults = {};
+const inFlightToolResults = {};
+const TOOL_DEDUPE_WINDOW_MS = 8000;
 
 function coerceBoolean(value) {
   if (typeof value === "boolean") return value;
@@ -151,6 +154,39 @@ function pruneCallContextStore() {
     }
   }
   if (removed > 0) console.log(`[call-context] pruned ${removed} stale entr${removed === 1 ? "y" : "ies"}`);
+}
+
+function makeToolDedupeKey(toolName, payload) {
+  return `${toolName}:${JSON.stringify(payload ?? {})}`;
+}
+
+function getRecentToolResult(toolName, payload) {
+  const key = makeToolDedupeKey(toolName, payload);
+  const entry = recentToolResults[key];
+  if (!entry) return null;
+  if (Date.now() - entry.atMs > TOOL_DEDUPE_WINDOW_MS) {
+    delete recentToolResults[key];
+    return null;
+  }
+  return entry.result;
+}
+
+function setRecentToolResult(toolName, payload, result) {
+  const key = makeToolDedupeKey(toolName, payload);
+  recentToolResults[key] = { atMs: Date.now(), result };
+}
+
+function getInFlightToolPromise(toolName, payload) {
+  const key = makeToolDedupeKey(toolName, payload);
+  return { key, promise: inFlightToolResults[key] || null };
+}
+
+function setInFlightToolPromise(key, promise) {
+  inFlightToolResults[key] = promise;
+}
+
+function clearInFlightToolPromise(key) {
+  delete inFlightToolResults[key];
 }
 
 async function fetchJsonWithTimeout(url, { timeoutMs = 12000, ...options } = {}) {
@@ -373,7 +409,23 @@ app.post("/tools/search_recipes", async (req, res) => {
     const phoneFromBody = normalizePhone(params?.phone);
     const phoneFromCallCtx = call_id ? callContextStore[call_id]?.phone : "";
     const phone = phoneFromBody || extracted || phoneFromCallCtx || "";
-    const result = await handleSearchRecipes({ ...params, ingredients: params.ingredients, phone, call_id });
+    const dedupePayload = { call_id: call_id || "", phone: phone || "", ingredients: params.ingredients || [] };
+    const cached = getRecentToolResult("search_recipes", dedupePayload);
+    if (cached) return res.json(cached);
+    const { key, promise } = getInFlightToolPromise("search_recipes", dedupePayload);
+    if (promise) {
+      const result = await promise;
+      return res.json(result);
+    }
+    const run = handleSearchRecipes({ ...params, ingredients: params.ingredients, phone, call_id });
+    setInFlightToolPromise(key, run);
+    let result;
+    try {
+      result = await run;
+    } finally {
+      clearInFlightToolPromise(key);
+    }
+    setRecentToolResult("search_recipes", dedupePayload, result);
     res.json(result);
   } catch (err) {
     console.error("[tools/search_recipes] error:", err.message);
@@ -383,7 +435,23 @@ app.post("/tools/search_recipes", async (req, res) => {
 
 app.post("/tools/get_recipe_details", async (req, res) => {
   try {
-    const result = await handleGetRecipeDetails(req.body);
+    const dedupePayload = { recipe_id: req.body?.recipe_id };
+    const cached = getRecentToolResult("get_recipe_details", dedupePayload);
+    if (cached) return res.json(cached);
+    const { key, promise } = getInFlightToolPromise("get_recipe_details", dedupePayload);
+    if (promise) {
+      const result = await promise;
+      return res.json(result);
+    }
+    const run = handleGetRecipeDetails(req.body);
+    setInFlightToolPromise(key, run);
+    let result;
+    try {
+      result = await run;
+    } finally {
+      clearInFlightToolPromise(key);
+    }
+    setRecentToolResult("get_recipe_details", dedupePayload, result);
     res.json(result);
   } catch (err) {
     console.error("[tools/get_recipe_details] error:", err.message);
